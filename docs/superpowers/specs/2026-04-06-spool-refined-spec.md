@@ -2,7 +2,7 @@
 
 ## Document Status
 
-- Status: Draft for review
+- Status: Canonical v1 technical specification
 - Date: 2026-04-06
 - Type: Main product spec with implementation-facing examples
 - Product: Spool
@@ -276,7 +276,7 @@ Spool uses a planner, generator, evaluator model.
 
 The evaluator operates from a bounded evaluator packet rather than unrestricted generator context.
 
-A likely v1 implementation is a subagent callout with:
+V1 requires:
 
 - dedicated evaluator prompt
 - bounded evaluator packet
@@ -1121,6 +1121,22 @@ Projection rules:
 
 This rule exists to prevent contradiction drift between evidence state, task results, compaction outputs, and resumed sessions.
 
+### 9.4.2 Runtime Contradiction Adjudication Requirements
+
+Runtime contradiction handling in v1 must satisfy the following requirements:
+
+- the contradiction ledger remains the authoritative contradiction surface
+- the contradiction ledger is a mutable current-state ledger in v1: records may be updated as investigation progresses, but they must not be deleted
+- generator-side contradiction handling must detect materially relevant conflicts, record them in the contradiction ledger before attempting resolution, and avoid narrative-only conflict absorption
+- evaluator-side contradiction handling must review contradiction completeness, materiality, resolution validity, and contradiction pressure on final state and confidence
+- evaluator contradiction adjudication may instruct generator-side contradiction corrections through bounded evaluator outcomes; the generator must apply those corrections before the next evaluation pass
+
+Minimum v1 contradiction contract additions include:
+
+- whether contradiction resolution was attempted
+- an optional contradiction resolution note when resolution or attempted resolution must be explained
+- evidence-class support for durable-memory claims and user assertions when they participate directly in contradiction handling
+
 ### 9.5 Intermediate Artifacts
 
 Meaningful intermediate artifacts are persisted, including:
@@ -1220,7 +1236,7 @@ It should contain at least:
 - `blockers`
 - `open_questions`
 - `proposed_changes`
-- `contradictions`
+- `contradiction_refs`
 
 ### 10.2 Result States
 

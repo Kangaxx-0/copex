@@ -2277,6 +2277,17 @@ impl Config {
             })?
             .clone();
 
+        // If Copilot provider is selected, resolve the API endpoint and inject token.
+        let model_provider = if model_provider.is_copilot() {
+            let mut provider = model_provider;
+            resolve_copilot_provider(&mut provider).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+            })?;
+            provider
+        } else {
+            model_provider
+        };
+
         let shell_environment_policy = cfg.shell_environment_policy.into();
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
 
@@ -2859,6 +2870,29 @@ pub fn find_codex_home() -> std::io::Result<PathBuf> {
 /// that the directory exists.
 pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
     Ok(cfg.log_dir.clone())
+}
+
+fn resolve_copilot_provider(provider: &mut ModelProviderInfo) -> anyhow::Result<()> {
+    use crate::copilot_auth::{fetch_copilot_user_info, read_copilot_token_from_store};
+    use codex_keyring_store::DefaultKeyringStore;
+
+    let store = DefaultKeyringStore;
+    let token = read_copilot_token_from_store(&store, None)?;
+
+    let handle = tokio::runtime::Handle::current();
+    let user_info = tokio::task::block_in_place(|| handle.block_on(fetch_copilot_user_info(&token)))?;
+
+    tracing::info!(
+        login = %user_info.login,
+        plan = %user_info.copilot_plan,
+        endpoint = %user_info.api_endpoint,
+        "Copilot provider initialized"
+    );
+
+    provider.base_url = Some(user_info.api_endpoint);
+    provider.experimental_bearer_token = Some(token);
+
+    Ok(())
 }
 
 #[cfg(test)]

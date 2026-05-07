@@ -1386,6 +1386,7 @@ dependencies = [
  "tracing",
  "tungstenite",
  "url",
+ "urlencoding",
  "wiremock",
 ]
 
@@ -1836,6 +1837,7 @@ dependencies = [
  "codex-git-utils",
  "codex-hooks",
  "codex-instructions",
+ "codex-keyring-store",
  "codex-login",
  "codex-network-proxy",
  "codex-otel",

@@ -92,6 +92,7 @@ pub enum ResponseEvent {
     },
     RateLimits(RateLimitSnapshot),
     ModelsEtag(String),
+    CopilotQuota(std::collections::HashMap<String, crate::copilot_quota::CopilotQuotaSnapshot>),
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]

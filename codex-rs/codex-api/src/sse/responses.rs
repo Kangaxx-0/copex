@@ -91,6 +91,13 @@ pub fn spawn_response_stream(
         for snapshot in rate_limit_snapshots {
             let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
         }
+        let copilot_quotas =
+            crate::copilot_quota::parse_copilot_quota_headers(&stream_response.headers);
+        if !copilot_quotas.is_empty() {
+            let _ = tx_event
+                .send(Ok(ResponseEvent::CopilotQuota(copilot_quotas)))
+                .await;
+        }
         if let Some(etag) = models_etag {
             let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
         }

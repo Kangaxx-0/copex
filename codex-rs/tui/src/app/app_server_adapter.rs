@@ -469,6 +469,7 @@ fn server_notification_thread_events(
                         model_context_window: notification.token_usage.model_context_window,
                     }),
                     rate_limits: None,
+                    copilot_quota: None,
                 }),
             }],
         )),

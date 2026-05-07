@@ -1844,6 +1844,7 @@ async fn review_restores_context_window_indicator() {
         msg: EventMsg::TokenCount(TokenCountEvent {
             info: Some(make_token_info(pre_review_tokens, context_window)),
             rate_limits: None,
+            copilot_quota: None,
         }),
     });
     assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
@@ -1863,6 +1864,7 @@ async fn review_restores_context_window_indicator() {
         msg: EventMsg::TokenCount(TokenCountEvent {
             info: Some(make_token_info(review_tokens, context_window)),
             rate_limits: None,
+            copilot_quota: None,
         }),
     });
     assert_eq!(chat.bottom_pane.context_window_percent(), Some(97));
@@ -1892,6 +1894,7 @@ async fn token_count_none_resets_context_indicator() {
         msg: EventMsg::TokenCount(TokenCountEvent {
             info: Some(make_token_info(pre_compact_tokens, context_window)),
             rate_limits: None,
+            copilot_quota: None,
         }),
     });
     assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
@@ -1901,6 +1904,7 @@ async fn token_count_none_resets_context_indicator() {
         msg: EventMsg::TokenCount(TokenCountEvent {
             info: None,
             rate_limits: None,
+            copilot_quota: None,
         }),
     });
     assert_eq!(chat.bottom_pane.context_window_percent(), None);
@@ -1931,6 +1935,7 @@ async fn context_indicator_shows_used_tokens_when_window_unknown() {
         msg: EventMsg::TokenCount(TokenCountEvent {
             info: Some(token_info),
             rate_limits: None,
+            copilot_quota: None,
         }),
     });
 

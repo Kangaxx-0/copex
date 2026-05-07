@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod common;
+pub mod copilot_quota;
 pub mod endpoint;
 pub mod error;
 pub mod provider;

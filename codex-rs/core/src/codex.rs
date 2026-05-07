@@ -311,6 +311,7 @@ use crate::protocol::SkillMetadata as ProtocolSkillMetadata;
 use crate::protocol::SkillToolDependency as ProtocolSkillToolDependency;
 use crate::protocol::StreamErrorEvent;
 use crate::protocol::Submission;
+use crate::protocol::CopilotQuota;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
@@ -3791,12 +3792,35 @@ impl Session {
         state.set_server_reasoning_included(included);
     }
 
+    pub(crate) async fn update_copilot_quota(
+        &self,
+        turn_context: &TurnContext,
+        quotas: std::collections::HashMap<String, codex_api::copilot_quota::CopilotQuotaSnapshot>,
+    ) {
+        let converted: Vec<CopilotQuota> = quotas
+            .into_iter()
+            .map(|(category, snap)| CopilotQuota {
+                category,
+                entitlement: snap.entitlement,
+                percent_remaining: snap.percent_remaining,
+                unlimited: snap.entitlement < 0,
+                resets_at: Some(snap.resets_at),
+            })
+            .collect();
+        {
+            let mut state = self.state.lock().await;
+            state.set_copilot_quota(converted);
+        }
+        self.send_token_count_event(turn_context).await;
+    }
+
     async fn send_token_count_event(&self, turn_context: &TurnContext) {
-        let (info, rate_limits) = {
+        let (info, rate_limits, copilot_quota) = {
             let state = self.state.lock().await;
             state.token_info_and_rate_limits()
         };
-        let event = EventMsg::TokenCount(TokenCountEvent { info, rate_limits });
+        let event =
+            EventMsg::TokenCount(TokenCountEvent { info, rate_limits, copilot_quota });
         self.send_event(turn_context, event).await;
     }
 
@@ -7376,6 +7400,9 @@ async fn try_run_sampling_request(
             ResponseEvent::ModelsEtag(etag) => {
                 // Update internal state with latest models etag
                 sess.services.models_manager.refresh_if_new_etag(etag).await;
+            }
+            ResponseEvent::CopilotQuota(quotas) => {
+                sess.update_copilot_quota(&turn_context, quotas).await;
             }
             ResponseEvent::Completed {
                 response_id: _,

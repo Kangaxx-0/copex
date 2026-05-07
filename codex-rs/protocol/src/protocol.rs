@@ -1954,10 +1954,22 @@ impl TokenUsageInfo {
     }
 }
 
+/// Copilot subscription quota snapshot from response headers.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, JsonSchema, TS)]
+pub struct CopilotQuota {
+    pub category: String,
+    #[ts(type = "number")]
+    pub entitlement: i64,
+    pub percent_remaining: f64,
+    pub unlimited: bool,
+    pub resets_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TokenCountEvent {
     pub info: Option<TokenUsageInfo>,
     pub rate_limits: Option<RateLimitSnapshot>,
+    pub copilot_quota: Option<Vec<CopilotQuota>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]

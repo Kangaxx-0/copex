@@ -1,26 +1,26 @@
-# Spool Dev Planning Readiness Design
+# Spool Development Planning Specification
 
 ## Document Status
 
-- Status: Draft for review
+- Status: Canonical planning specification
 - Date: 2026-04-06
-- Type: Design review and planning-readiness addendum
+- Type: Development planning specification
 - Governing product spec: `2026-04-06-spool-refined-spec.md`
 
 ## 1. Purpose
 
-This document records the planning-oriented design conclusions reached after reviewing the Spool refined spec.
+This document defines the planning architecture for implementing Spool from the governing product spec.
 
 It answers a narrower question than the governing product spec:
 
-- is the refined spec ready to move into development planning
-- if so, what shape should the dev planning take
+- the planning shape required to implement the product spec
+- the required structure and sequencing of the dev plan set
 
-This document does not replace the governing product spec. It constrains how the next planning step should be performed.
+This document does not replace the governing product spec. It defines how development planning must be structured from that spec.
 
 ## 2. Readiness Assessment
 
-The refined Spool spec is ready to move into dev planning.
+The refined Spool spec is sufficient to support development planning.
 
 The spec is strong enough at the product-semantics layer to support implementation planning for:
 
@@ -45,20 +45,20 @@ The main open items still visible in the governing spec are:
 - exact TUI component-tree details
 - exact local persistence file formats
 
-These open items should not block dev planning across the board. They should instead be surfaced and owned by the specific dev plans that need to resolve them.
+These open items do not block development planning across the board. They must instead be surfaced and owned by the specific dev plans that need to resolve them.
 
 ## 3. Planning Shape
 
-Spool should not move into a single master implementation plan.
+Spool does not use a single master implementation plan.
 
-The correct next step is a coordinated set of dev plans.
+Spool uses a coordinated set of dev plans.
 
-The recommended planning model is hybrid:
+The planning model is hybrid:
 
-- each dev plan should own a clean subsystem boundary or a tightly bounded vertical slice
-- the overall roadmap should group those plans into delivery waves with explicit dependencies
+- each dev plan owns a clean subsystem boundary or a tightly bounded vertical slice
+- the overall roadmap groups those plans into delivery waves with explicit dependencies
 
-This hybrid model is preferred over phase-only planning because the Spool spec spans multiple technical seams with different risks:
+This hybrid model is required because the Spool spec spans multiple technical seams with different risks:
 
 - harness semantics
 - Fabric adapters
@@ -67,15 +67,15 @@ This hybrid model is preferred over phase-only planning because the Spool spec s
 - TUI and session UX
 - exports, durable memory, and operational hardening
 
-Using only delivery phases would make it too easy to mix ownership and acceptance criteria inside one plan. Using only subsystem plans would make the roadmap harder to sequence and evaluate as product delivery. The plan set should use subsystem-clean plans presented in phased order.
+Using only delivery phases would mix ownership and acceptance criteria inside one plan. Using only subsystem plans would make the roadmap harder to sequence and evaluate as product delivery. The plan set therefore uses subsystem-clean plans presented in phased order.
 
 ## 4. Plan 1 Rule
 
 Plan 1 is a special case.
 
-Plan 1 should validate harness semantics in isolation and should not depend on live Fabric readiness.
+Plan 1 validates harness semantics in isolation and does not depend on live Fabric readiness.
 
-Plan 1 should focus on:
+Plan 1 focuses on:
 
 - canonical task-contract modeling
 - evidence-ledger and contradiction-ledger semantics
@@ -86,20 +86,20 @@ Plan 1 should focus on:
 - pending interaction semantics for approval and user input
 - persisted structured state needed for resume and compaction
 
-Plan 1 should use simulated or fixture-backed adapters only.
+Plan 1 uses simulated or fixture-backed adapters only.
 
-Plan 1 completion should be proven through:
+Plan 1 completion is proven through:
 
 - contract tests
 - state-machine tests
 - deterministic fixture scenarios
 
-Those proofs should cover both:
+Those proofs cover both:
 
 - terminal result production
 - non-terminal waiting states such as pending user input or pending approval
 
-Plan 1 should not require:
+Plan 1 does not require:
 
 - live auth
 - live Fabric artifact resolution
@@ -108,18 +108,18 @@ Plan 1 should not require:
 
 ## 5. Integration Validation Rule For Later Plans
 
-Every dev plan after Plan 1 should include an explicit integration-validation path.
+Every dev plan after Plan 1 includes an explicit integration-validation path.
 
-That validation path should identify:
+That validation path identifies:
 
 - the seam being proven
 - the scenario being exercised
 - the environment used
 - the success condition
 
-Whenever possible, these validation paths should use real external systems rather than only local fixtures.
+Whenever possible, these validation paths use real external systems rather than only local fixtures.
 
-For Spool, this means later plans should prefer validation against the dev Fabric workspace when the plan meaningfully touches live Fabric behavior or another live external seam.
+For Spool, later plans prefer validation against the dev Fabric workspace when the plan meaningfully touches live Fabric behavior or another live external seam.
 
 Fixture-only validation remains acceptable when:
 
@@ -129,23 +129,23 @@ Fixture-only validation remains acceptable when:
 
 ## 6. Validation Environment Assumptions
 
-The current planning assumptions are:
+Planning assumptions:
 
 - a dev Fabric workspace exists
 - Spool can read required environment or connection details from its configuration file
 
-Validation fixtures should use a mixed strategy:
+Validation fixtures use a mixed strategy:
 
 - define a small stable shared fixture set that multiple plans can reuse
 - allow additional plan-specific fixtures when justified by the plan's scope
 
-Plans should prefer the shared fixture set first and explicitly justify any plan-specific fixture additions.
+Plans prefer the shared fixture set first and explicitly justify any plan-specific fixture additions.
 
 ## 7. Required Dev-Plan Structure
 
-The `writing-plans` skill should be used to author the actual dev plans.
+The `writing-plans` skill is used to author the dev plans.
 
-For Spool, each plan should include both the normal `writing-plans` structure and the following product-specific requirements:
+For Spool, each plan includes both the normal `writing-plans` structure and the following product-specific requirements:
 
 - a clear subsystem or bounded-slice scope
 - explicit out-of-scope section
@@ -154,17 +154,17 @@ For Spool, each plan should include both the normal `writing-plans` structure an
 - validation section with the plan's integration-validation path
 - open-items section listing relevant unresolved decisions
 
-The required open-items section should distinguish:
+The required open-items section distinguishes:
 
 - open items owned by the plan
 - open items noted but deferred to another plan
 - review triggers that would require reopening the plan
 
-This is necessary so deferred technical uncertainty remains visible during plan review instead of disappearing behind seemingly clean plan scope.
+This keeps deferred technical uncertainty visible during plan review instead of allowing it to disappear behind seemingly clean plan scope.
 
-## 8. Recommended Dev-Plan Set
+## 8. Development Plan Set
 
-The current recommended plan set is:
+The development plan set for v1 is:
 
 1. Harness Semantics Foundation
 2. Fabric Adapter Foundations
@@ -173,9 +173,9 @@ The current recommended plan set is:
 5. TUI And Session UX
 6. Operationalization And Hardening
 
-These plans should be presented in delivery waves, but each plan should remain technically clean in scope and reviewable on its own.
+These plans are presented in delivery waves, but each plan remains technically clean in scope and reviewable on its own.
 
-Representative intent for each plan:
+Plan intent:
 
 1. Harness Semantics Foundation
    - prove the core task/evidence/result/resume semantics in isolation
@@ -190,19 +190,43 @@ Representative intent for each plan:
 6. Operationalization And Hardening
    - establish exports, durable memory, policy hardening, telemetry, and polish
 
-The first concrete live scenario does not need to be fixed before writing the plan set. It should instead be finalized as part of the relevant later plan's validation section.
+The first concrete live scenario does not need to be fixed before writing the plan set. It is finalized as part of the relevant later plan's validation section.
+
+## 8.1 Planned Workspace Shape
+
+The plans target a future Rust workspace rooted at:
+
+```text
+spool/
+  Cargo.toml
+  rust-toolchain.toml
+  README.md
+  docs/
+    specs/
+    architecture/
+  spool/
+  spool-core/
+  spool-model/
+  spool-fabric/
+  spool-knowledge/
+  spool-index/
+  spool-tui/
+  spool-otel/
+```
+
+This workspace shape includes a thin `spool/` app crate. It does not use a separate `spool-cli/` crate in v1 planning.
 
 ## 9. Governing Review Standard
 
-During dev-plan review, reviewers should distinguish between:
+During dev-plan review, reviewers distinguish between:
 
 - governing product contracts that should remain stable unless disproven
 - implementation choices that a specific plan is expected to resolve
 
-The purpose of the plan set is not to reopen the entire product definition. The purpose is to move from the refined product semantics into executable engineering work while keeping open technical decisions visible and owned.
+The purpose of the plan set is not to reopen the entire product definition. The purpose is to move from refined product semantics into executable engineering work while keeping open technical decisions visible and owned.
 
 ## 10. Conclusion
 
-Spool is ready for multiple dev plans now.
+Spool uses multiple coordinated dev plans.
 
-The correct next step is to use the `writing-plans` skill to author a coordinated plan set based on the refined spec and this planning-readiness design.
+The next planning action is to use the `writing-plans` skill to author the coordinated plan set defined by this document and the governing product spec.

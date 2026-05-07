@@ -13,6 +13,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::NetworkAccess;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::CopilotQuota;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_utils_sandbox_summary::summarize_sandbox_policy;
@@ -73,6 +74,7 @@ struct StatusHistoryCell {
     forked_from: Option<String>,
     token_usage: StatusTokenUsageData,
     rate_limits: StatusRateLimitData,
+    copilot_quota: Option<Vec<CopilotQuota>>,
 }
 
 #[cfg(test)]
@@ -107,6 +109,7 @@ pub(crate) fn new_status_output(
         model_name,
         collaboration_mode,
         reasoning_effort_override,
+        None,
     )
 }
 
@@ -125,6 +128,7 @@ pub(crate) fn new_status_output_with_rate_limits(
     model_name: &str,
     collaboration_mode: Option<&str>,
     reasoning_effort_override: Option<Option<ReasoningEffort>>,
+    copilot_quota: Option<Vec<CopilotQuota>>,
 ) -> CompositeHistoryCell {
     let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
     let card = StatusHistoryCell::new(
@@ -141,6 +145,7 @@ pub(crate) fn new_status_output_with_rate_limits(
         model_name,
         collaboration_mode,
         reasoning_effort_override,
+        copilot_quota,
     );
 
     CompositeHistoryCell::new(vec![Box::new(command), Box::new(card)])
@@ -162,6 +167,7 @@ impl StatusHistoryCell {
         model_name: &str,
         collaboration_mode: Option<&str>,
         reasoning_effort_override: Option<Option<ReasoningEffort>>,
+        copilot_quota: Option<Vec<CopilotQuota>>,
     ) -> Self {
         let mut config_entries = vec![
             ("workdir", config.cwd.display().to_string()),
@@ -266,7 +272,42 @@ impl StatusHistoryCell {
             forked_from,
             token_usage,
             rate_limits,
+            copilot_quota,
         }
+    }
+
+    fn copilot_quota_spans(&self) -> Option<Vec<Span<'static>>> {
+        let quotas = self.copilot_quota.as_ref()?;
+        let primary = quotas
+            .iter()
+            .find(|q| q.category == "premium_interactions")?;
+
+        let mut spans = vec![];
+        if primary.unlimited {
+            spans.push(Span::from(format!(
+                "{}% remaining",
+                primary.percent_remaining
+            )));
+            spans.push(Span::from(" (unlimited)").dim());
+        } else {
+            let remaining =
+                (primary.entitlement as f64 * primary.percent_remaining / 100.0) as i64;
+            spans.push(Span::from(format!(
+                "{}% remaining",
+                primary.percent_remaining
+            )));
+            spans.push(
+                Span::from(format!(
+                    " ({}/{} premium interactions)",
+                    remaining, primary.entitlement
+                ))
+                .dim(),
+            );
+        }
+        if let Some(resets_at) = &primary.resets_at {
+            spans.push(Span::from(format!(", resets {resets_at}")).dim());
+        }
+        Some(spans)
     }
 
     fn token_usage_spans(&self) -> Vec<Span<'static>> {
@@ -528,6 +569,10 @@ impl HistoryCell for StatusHistoryCell {
         // Hide token usage only for ChatGPT subscribers
         if !matches!(self.account, Some(StatusAccountDisplay::ChatGpt { .. })) {
             lines.push(formatter.line("Token usage", self.token_usage_spans()));
+        }
+
+        if let Some(quota_spans) = self.copilot_quota_spans() {
+            lines.push(formatter.line("Copilot quota", quota_spans));
         }
 
         if let Some(spans) = self.context_window_spans() {

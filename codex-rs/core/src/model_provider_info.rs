@@ -30,6 +30,8 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
+const COPILOT_PROVIDER_NAME: &str = "GitHub Copilot";
+pub const COPILOT_PROVIDER_ID: &str = "copilot";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub(crate) const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub(crate) const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -130,6 +132,10 @@ pub struct ModelProviderInfo {
 }
 
 impl ModelProviderInfo {
+    pub fn is_copilot(&self) -> bool {
+        self.name == COPILOT_PROVIDER_NAME
+    }
+
     fn build_header_map(&self) -> crate::error::Result<HeaderMap> {
         let capacity = self.http_headers.as_ref().map_or(0, HashMap::len)
             + self.env_http_headers.as_ref().map_or(0, HashMap::len);
@@ -285,6 +291,44 @@ pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
 pub const LMSTUDIO_OSS_PROVIDER_ID: &str = "lmstudio";
 pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
 
+pub fn create_copilot_provider() -> ModelProviderInfo {
+    ModelProviderInfo {
+        name: COPILOT_PROVIDER_NAME.into(),
+        base_url: None, // Resolved dynamically at startup
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: Some(
+            [
+                (
+                    "Copilot-Integration-Id".to_string(),
+                    "copilot-developer-cli".to_string(),
+                ),
+                (
+                    "X-GitHub-Api-Version".to_string(),
+                    "2026-01-09".to_string(),
+                ),
+                (
+                    "Openai-Intent".to_string(),
+                    "conversation-agent".to_string(),
+                ),
+                ("X-Initiator".to_string(), "user".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    }
+}
+
 /// Built-in default provider list.
 pub fn built_in_model_providers(
     openai_base_url: Option<String>,
@@ -298,6 +342,7 @@ pub fn built_in_model_providers(
     // `model_providers` in config.toml to add their own providers.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
+        (COPILOT_PROVIDER_ID, create_copilot_provider()),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),

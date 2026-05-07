@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use crate::codex::PreviousTurnSettings;
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
+use crate::protocol::CopilotQuota;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
@@ -21,6 +22,7 @@ pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
+    pub(crate) latest_copilot_quota: Option<Vec<CopilotQuota>>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) dependency_env: HashMap<String, String>,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
@@ -43,6 +45,7 @@ impl SessionState {
             session_configuration,
             history,
             latest_rate_limits: None,
+            latest_copilot_quota: None,
             server_reasoning_included: false,
             dependency_env: HashMap::new(),
             mcp_dependency_prompted: HashSet::new(),
@@ -121,8 +124,20 @@ impl SessionState {
 
     pub(crate) fn token_info_and_rate_limits(
         &self,
-    ) -> (Option<TokenUsageInfo>, Option<RateLimitSnapshot>) {
-        (self.token_info(), self.latest_rate_limits.clone())
+    ) -> (
+        Option<TokenUsageInfo>,
+        Option<RateLimitSnapshot>,
+        Option<Vec<CopilotQuota>>,
+    ) {
+        (
+            self.token_info(),
+            self.latest_rate_limits.clone(),
+            self.latest_copilot_quota.clone(),
+        )
+    }
+
+    pub(crate) fn set_copilot_quota(&mut self, quota: Vec<CopilotQuota>) {
+        self.latest_copilot_quota = Some(quota);
     }
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
