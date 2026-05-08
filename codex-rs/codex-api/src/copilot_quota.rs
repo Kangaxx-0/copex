@@ -21,10 +21,10 @@ pub fn parse_copilot_quota_headers(headers: &HeaderMap) -> HashMap<String, Copil
     let mut quotas = HashMap::new();
     for (name, value) in headers.iter() {
         let header_name = name.as_str().to_ascii_lowercase();
-        if let Some(category) = header_name.strip_prefix(QUOTA_HEADER_PREFIX) {
-            if let Some(snapshot) = value.to_str().ok().and_then(parse_quota_snapshot_header) {
-                quotas.insert(category.to_string(), snapshot);
-            }
+        if let Some(category) = header_name.strip_prefix(QUOTA_HEADER_PREFIX)
+            && let Some(snapshot) = value.to_str().ok().and_then(parse_quota_snapshot_header)
+        {
+            quotas.insert(category.to_string(), snapshot);
         }
     }
     quotas

@@ -1,27 +1,48 @@
-use async_trait::async_trait;
+use codex_protocol::items::ImageViewItem;
+use codex_protocol::items::TurnItem;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::InputModality;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::load_for_prompt_bytes;
 use serde::Deserialize;
 
 use crate::function_tool::FunctionCallError;
 use crate::original_image_detail::can_request_original_image_detail;
-use crate::protocol::EventMsg;
-use crate::protocol::ViewImageToolCallEvent;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
+use crate::tools::handlers::view_image_spec::create_view_image_tool;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use codex_tools::ToolName;
+use codex_tools::ToolSpec;
 
-pub struct ViewImageHandler;
+pub struct ViewImageHandler {
+    options: ViewImageToolOptions,
+}
+
+impl Default for ViewImageHandler {
+    fn default() -> Self {
+        Self {
+            options: ViewImageToolOptions {
+                can_request_original_image_detail: false,
+            },
+        }
+    }
+}
+
+impl ViewImageHandler {
+    pub(crate) fn new(options: ViewImageToolOptions) -> Self {
+        Self { options }
+    }
+}
 
 const VIEW_IMAGE_UNSUPPORTED_MESSAGE: &str =
     "view_image is not allowed because you do not support image inputs";
@@ -37,9 +58,20 @@ enum ViewImageDetail {
     Original,
 }
 
-#[async_trait]
 impl ToolHandler for ViewImageHandler {
     type Output = ViewImageOutput;
+
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("view_image")
+    }
+
+    fn spec(&self) -> Option<ToolSpec> {
+        Some(create_view_image_tool(self.options))
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
 
     fn kind(&self) -> ToolKind {
         ToolKind::Function
@@ -89,15 +121,21 @@ impl ToolHandler for ViewImageHandler {
             }
         };
 
-        let abs_path =
-            AbsolutePathBuf::try_from(turn.resolve_path(Some(args.path))).map_err(|error| {
-                FunctionCallError::RespondToModel(format!("unable to resolve image path: {error}"))
-            })?;
+        let abs_path = turn.resolve_path(Some(args.path));
+        let Some(environment) = turn.environments.primary() else {
+            return Err(FunctionCallError::RespondToModel(
+                "view_image is unavailable in this session".to_string(),
+            ));
+        };
+        let sandbox = environment
+            .environment
+            .is_remote()
+            .then(|| turn.file_system_sandbox_context(/*additional_permissions*/ None));
 
-        let metadata = turn
+        let metadata = environment
             .environment
             .get_filesystem()
-            .get_metadata(&abs_path)
+            .get_metadata(&abs_path, sandbox.as_ref())
             .await
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
@@ -112,10 +150,10 @@ impl ToolHandler for ViewImageHandler {
                 abs_path.display()
             )));
         }
-        let file_bytes = turn
+        let file_bytes = environment
             .environment
             .get_filesystem()
-            .read_file(&abs_path)
+            .read_file(&abs_path, sandbox.as_ref())
             .await
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
@@ -123,10 +161,9 @@ impl ToolHandler for ViewImageHandler {
                     abs_path.display()
                 ))
             })?;
-        let event_path = abs_path.to_path_buf();
+        let event_path = abs_path.clone();
 
-        let can_request_original_detail =
-            can_request_original_image_detail(turn.features.get(), &turn.model_info);
+        let can_request_original_detail = can_request_original_image_detail(&turn.model_info);
         let use_original_detail =
             can_request_original_detail && matches!(detail, Some(ViewImageDetail::Original));
         let image_mode = if use_original_detail {
@@ -134,7 +171,11 @@ impl ToolHandler for ViewImageHandler {
         } else {
             PromptImageMode::ResizeToFit
         };
-        let image_detail = use_original_detail.then_some(ImageDetail::Original);
+        let image_detail = Some(if use_original_detail {
+            ImageDetail::Original
+        } else {
+            DEFAULT_IMAGE_DETAIL
+        });
 
         let image =
             load_for_prompt_bytes(abs_path.as_path(), file_bytes, image_mode).map_err(|error| {
@@ -145,15 +186,12 @@ impl ToolHandler for ViewImageHandler {
             })?;
         let image_url = image.into_data_url();
 
-        session
-            .send_event(
-                turn.as_ref(),
-                EventMsg::ViewImageToolCall(ViewImageToolCallEvent {
-                    call_id,
-                    path: event_path,
-                }),
-            )
-            .await;
+        let item = TurnItem::ImageView(ImageViewItem {
+            id: call_id,
+            path: event_path,
+        });
+        session.emit_turn_item_started(turn.as_ref(), &item).await;
+        session.emit_turn_item_completed(turn.as_ref(), item).await;
 
         Ok(ViewImageOutput {
             image_url,
@@ -211,7 +249,7 @@ mod tests {
     fn code_mode_result_returns_image_url_object() {
         let output = ViewImageOutput {
             image_url: "data:image/png;base64,AAA".to_string(),
-            image_detail: None,
+            image_detail: Some(DEFAULT_IMAGE_DETAIL),
         };
 
         let result = output.code_mode_result(&ToolPayload::Function {
@@ -222,7 +260,7 @@ mod tests {
             result,
             json!({
                 "image_url": "data:image/png;base64,AAA",
-                "detail": null,
+                "detail": "high",
             })
         );
     }

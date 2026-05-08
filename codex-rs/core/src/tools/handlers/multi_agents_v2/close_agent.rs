@@ -1,10 +1,20 @@
 use super::*;
+use crate::tools::handlers::multi_agents_spec::create_close_agent_tool_v2;
+use crate::turn_timing::now_unix_timestamp_ms;
+use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
 
-#[async_trait]
 impl ToolHandler for Handler {
     type Output = CloseAgentResult;
+
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("close_agent")
+    }
+
+    fn spec(&self) -> Option<ToolSpec> {
+        Some(create_close_agent_tool_v2())
+    }
 
     fn kind(&self) -> ToolKind {
         ToolKind::Function
@@ -44,6 +54,7 @@ impl ToolHandler for Handler {
                 &turn,
                 CollabCloseBeginEvent {
                     call_id: call_id.clone(),
+                    started_at_ms: now_unix_timestamp_ms(),
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id: agent_id,
                 }
@@ -64,6 +75,7 @@ impl ToolHandler for Handler {
                         &turn,
                         CollabCloseEndEvent {
                             call_id: call_id.clone(),
+                            completed_at_ms: now_unix_timestamp_ms(),
                             sender_thread_id: session.conversation_id,
                             receiver_thread_id: agent_id,
                             receiver_agent_nickname: receiver_agent.agent_nickname.clone(),
@@ -88,6 +100,7 @@ impl ToolHandler for Handler {
                 &turn,
                 CollabCloseEndEvent {
                     call_id,
+                    completed_at_ms: now_unix_timestamp_ms(),
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id: agent_id,
                     receiver_agent_nickname: receiver_agent.agent_nickname,
@@ -106,6 +119,7 @@ impl ToolHandler for Handler {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CloseAgentArgs {
     target: String,
 }

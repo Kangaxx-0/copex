@@ -1,11 +1,20 @@
 use super::*;
 use crate::agent::control::ListedAgent;
+use crate::tools::handlers::multi_agents_spec::create_list_agents_tool;
+use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
 
-#[async_trait]
 impl ToolHandler for Handler {
     type Output = ListAgentsResult;
+
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("list_agents")
+    }
+
+    fn spec(&self) -> Option<ToolSpec> {
+        Some(create_list_agents_tool())
+    }
 
     fn kind(&self) -> ToolKind {
         ToolKind::Function
@@ -40,6 +49,7 @@ impl ToolHandler for Handler {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListAgentsArgs {
     path_prefix: Option<String>,
 }

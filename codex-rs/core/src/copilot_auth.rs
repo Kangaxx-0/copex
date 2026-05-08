@@ -26,10 +26,7 @@ pub(crate) struct CopilotQuotaSnapshot {
 }
 
 pub(crate) fn parse_copilot_user_info(json: &serde_json::Value) -> anyhow::Result<CopilotUserInfo> {
-    let login = json["login"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
+    let login = json["login"].as_str().unwrap_or("unknown").to_string();
 
     let copilot_plan = json["copilot_plan"]
         .as_str()
@@ -78,9 +75,7 @@ pub(crate) async fn fetch_copilot_user_info_from(
     url: &str,
     token: &str,
 ) -> anyhow::Result<CopilotUserInfo> {
-    let client = reqwest::Client::builder()
-        .user_agent("copex")
-        .build()?;
+    let client = reqwest::Client::builder().user_agent("copex").build()?;
     let resp = client
         .get(url)
         .header("Authorization", format!("Bearer {token}"))
@@ -120,7 +115,11 @@ pub(crate) fn read_copilot_token_from_store(
     store: &dyn KeyringStore,
     github_username: Option<&str>,
 ) -> anyhow::Result<String> {
-    read_copilot_token_impl(store, github_username, true)
+    read_copilot_token_impl(
+        store,
+        github_username,
+        /*allow_subprocess_fallback*/ true,
+    )
 }
 
 fn read_copilot_token_impl(
@@ -142,16 +141,19 @@ fn read_copilot_token_impl(
     if allow_subprocess_fallback {
         read_copilot_token_from_subprocess()
     } else {
-        anyhow::bail!(
-            "Copilot token not found in keyring for the given account."
-        )
+        anyhow::bail!("Copilot token not found in keyring for the given account.")
     }
 }
 
 /// Fallback: use macOS `security` command to read by service name only.
 fn read_copilot_token_from_subprocess() -> anyhow::Result<String> {
     let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", COPILOT_KEYCHAIN_SERVICE, "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            COPILOT_KEYCHAIN_SERVICE,
+            "-w",
+        ])
         .output()
         .map_err(|e| {
             anyhow::anyhow!(
@@ -182,7 +184,7 @@ mod tests {
         store: &dyn KeyringStore,
         username: Option<&str>,
     ) -> anyhow::Result<String> {
-        read_copilot_token_impl(store, username, false)
+        read_copilot_token_impl(store, username, /*allow_subprocess_fallback*/ false)
     }
 
     #[test]
@@ -203,10 +205,7 @@ mod tests {
         let result = read_token_no_fallback(&mock, Some("testuser"));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("Copilot token not found"),
-            "Error was: {err}"
-        );
+        assert!(err.contains("Copilot token not found"), "Error was: {err}");
     }
 
     #[test]
@@ -222,7 +221,7 @@ mod tests {
     #[test]
     fn test_read_copilot_token_without_username_returns_error_without_fallback() {
         let mock = MockKeyringStore::default();
-        let result = read_token_no_fallback(&mock, None);
+        let result = read_token_no_fallback(&mock, /*username*/ None);
         assert!(result.is_err());
     }
 
@@ -246,7 +245,10 @@ mod tests {
         });
 
         let info = parse_copilot_user_info(&json).unwrap();
-        assert_eq!(info.api_endpoint, "https://api.enterprise.githubcopilot.com");
+        assert_eq!(
+            info.api_endpoint,
+            "https://api.enterprise.githubcopilot.com"
+        );
         assert_eq!(info.login, "testuser");
         assert_eq!(info.copilot_plan, "enterprise");
         let quota = info.quota.as_ref().unwrap();
@@ -290,29 +292,6 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_auth_provider_returns_bearer_token() {
-        use crate::api_bridge::auth_provider_from_auth;
-        use crate::model_provider_info::create_copilot_provider;
-
-        let mut provider = create_copilot_provider();
-        provider.experimental_bearer_token = Some("gho_test_token".to_string());
-
-        let result = auth_provider_from_auth(None, &provider).unwrap();
-        // token is private, but auth_header_attached() confirms it was set
-        assert!(result.auth_header_attached());
-    }
-
-    #[test]
-    fn test_copilot_provider_without_token_has_no_auth() {
-        use crate::api_bridge::auth_provider_from_auth;
-        use crate::model_provider_info::create_copilot_provider;
-
-        let provider = create_copilot_provider();
-        let result = auth_provider_from_auth(None, &provider).unwrap();
-        assert!(!result.auth_header_attached());
-    }
-
-    #[test]
     fn test_parse_copilot_user_response_no_quota_is_ok() {
         let json = serde_json::json!({
             "login": "testuser",
@@ -329,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_copilot_provider_does_not_require_openai_auth() {
-        use crate::model_provider_info::create_copilot_provider;
+        use codex_model_provider_info::create_copilot_provider;
 
         let provider = create_copilot_provider();
         // requires_openai_auth = false means auth.json / login flow is never triggered
