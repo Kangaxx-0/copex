@@ -117,6 +117,7 @@ pub struct ToolsConfig {
     pub collab_tools: bool,
     pub goal_tools: bool,
     pub multi_agent_v2: bool,
+    pub multi_agent_v2_non_code_mode_only: bool,
     pub hide_spawn_agent_metadata: bool,
     pub spawn_agent_usage_hint: bool,
     pub spawn_agent_usage_hint_text: Option<String>,
@@ -203,6 +204,9 @@ impl ToolsConfig {
             ConfigShellToolType::UnifiedExec if !unified_exec_enabled => {
                 ConfigShellToolType::ShellCommand
             }
+            ConfigShellToolType::Default | ConfigShellToolType::Local => {
+                ConfigShellToolType::ShellCommand
+            }
             other => other,
         };
         let shell_type = if !features.enabled(Feature::ShellTool) {
@@ -219,11 +223,10 @@ impl ToolsConfig {
             model_shell_type
         };
 
-        let apply_patch_tool_type = match model_info.apply_patch_tool_type {
-            Some(ApplyPatchToolType::Freeform) => Some(ApplyPatchToolType::Freeform),
-            Some(ApplyPatchToolType::Function) => Some(ApplyPatchToolType::Function),
-            None => include_apply_patch_tool.then_some(ApplyPatchToolType::Freeform),
-        };
+        let apply_patch_tool_type = model_info
+            .apply_patch_tool_type
+            .clone()
+            .or_else(|| include_apply_patch_tool.then_some(ApplyPatchToolType::Freeform));
 
         let agent_jobs_worker_tools = include_agent_jobs
             && matches!(
@@ -255,6 +258,7 @@ impl ToolsConfig {
             collab_tools: include_collab_tools,
             goal_tools: include_goal_tools,
             multi_agent_v2: include_multi_agent_v2,
+            multi_agent_v2_non_code_mode_only: false,
             hide_spawn_agent_metadata: false,
             spawn_agent_usage_hint: true,
             spawn_agent_usage_hint_text: None,
@@ -309,6 +313,15 @@ impl ToolsConfig {
 
     pub fn with_hide_spawn_agent_metadata(mut self, hide_spawn_agent_metadata: bool) -> Self {
         self.hide_spawn_agent_metadata = hide_spawn_agent_metadata;
+        self
+    }
+
+    pub fn with_multi_agent_v2_non_code_mode_only(
+        mut self,
+        multi_agent_v2_non_code_mode_only: bool,
+    ) -> Self {
+        self.multi_agent_v2_non_code_mode_only =
+            self.multi_agent_v2 && multi_agent_v2_non_code_mode_only;
         self
     }
 
