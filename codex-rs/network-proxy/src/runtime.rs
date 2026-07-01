@@ -2,7 +2,11 @@ use crate::config::NetworkDomainPermission;
 use crate::config::NetworkMode;
 use crate::config::NetworkProxyConfig;
 use crate::config::ValidatedUnixSocketPath;
+use crate::credential_broker::CredentialBroker;
 use crate::mitm::MitmState;
+use crate::mitm_hook::HookEvaluation;
+use crate::mitm_hook::MitmHooksByHost;
+use crate::mitm_hook::evaluate_mitm_hooks;
 use crate::policy::Host;
 use crate::policy::is_loopback_host;
 use crate::policy::is_non_public_ip;
@@ -17,16 +21,17 @@ use crate::state::build_config_state;
 use crate::state::validate_policy_against_constraints;
 use anyhow::Context;
 use anyhow::Result;
-use async_trait::async_trait;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use globset::GlobSet;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -159,43 +164,44 @@ pub struct ConfigState {
     pub allow_set: GlobSet,
     pub deny_set: GlobSet,
     pub mitm: Option<Arc<MitmState>>,
+    pub mitm_hooks: MitmHooksByHost,
     pub constraints: NetworkProxyConstraints,
     pub blocked: VecDeque<BlockedRequest>,
     pub blocked_total: u64,
 }
 
-#[async_trait]
 pub trait ConfigReloader: Send + Sync {
     /// Human-readable description of where config is loaded from, for logs.
     fn source_label(&self) -> String;
 
     /// Return a freshly loaded state if a reload is needed; otherwise, return `None`.
-    async fn maybe_reload(&self) -> Result<Option<ConfigState>>;
+    fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>>;
 
     /// Force a reload, regardless of whether a change was detected.
-    async fn reload_now(&self) -> Result<ConfigState>;
+    fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState>;
 }
 
-#[async_trait]
+pub type ConfigReloaderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
 pub trait BlockedRequestObserver: Send + Sync + 'static {
-    async fn on_blocked_request(&self, request: BlockedRequest);
+    fn on_blocked_request(&self, request: BlockedRequest) -> BlockedRequestObserverFuture<'_>;
 }
 
-#[async_trait]
+pub type BlockedRequestObserverFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 impl<O: BlockedRequestObserver + ?Sized> BlockedRequestObserver for Arc<O> {
-    async fn on_blocked_request(&self, request: BlockedRequest) {
-        (**self).on_blocked_request(request).await
+    fn on_blocked_request(&self, request: BlockedRequest) -> BlockedRequestObserverFuture<'_> {
+        Box::pin(async move { (**self).on_blocked_request(request).await })
     }
 }
 
-#[async_trait]
 impl<F, Fut> BlockedRequestObserver for F
 where
     F: Fn(BlockedRequest) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ()> + Send,
+    Fut: Future<Output = ()> + Send + 'static,
 {
-    async fn on_blocked_request(&self, request: BlockedRequest) {
-        (self)(request).await
+    fn on_blocked_request(&self, request: BlockedRequest) -> BlockedRequestObserverFuture<'_> {
+        Box::pin((self)(request))
     }
 }
 
@@ -203,7 +209,15 @@ pub struct NetworkProxyState {
     state: Arc<RwLock<ConfigState>>,
     reloader: Arc<dyn ConfigReloader>,
     blocked_request_observer: Arc<RwLock<Option<Arc<dyn BlockedRequestObserver>>>>,
+    credential_broker: CredentialBroker,
     audit_metadata: NetworkProxyAuditMetadata,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostMitmRequirement {
+    None,
+    Tls,
+    Always,
 }
 
 impl std::fmt::Debug for NetworkProxyState {
@@ -220,6 +234,7 @@ impl Clone for NetworkProxyState {
             state: self.state.clone(),
             reloader: self.reloader.clone(),
             blocked_request_observer: self.blocked_request_observer.clone(),
+            credential_broker: self.credential_broker.clone(),
             audit_metadata: self.audit_metadata.clone(),
         }
     }
@@ -267,6 +282,7 @@ impl NetworkProxyState {
         blocked_request_observer: Option<Arc<dyn BlockedRequestObserver>>,
     ) -> Self {
         Self {
+            credential_broker: CredentialBroker::new(state.config.network.credential_broker),
             state: Arc::new(RwLock::new(state)),
             reloader,
             blocked_request_observer: Arc::new(RwLock::new(blocked_request_observer)),
@@ -284,6 +300,23 @@ impl NetworkProxyState {
 
     pub fn audit_metadata(&self) -> &NetworkProxyAuditMetadata {
         &self.audit_metadata
+    }
+
+    pub fn virtualize_child_credentials(&self, env: &mut HashMap<String, String>) {
+        self.credential_broker.virtualize_child_env(env);
+    }
+
+    pub fn inject_request_credentials(&self, host: &str, headers: &mut rama_http::HeaderMap) {
+        self.credential_broker.inject_request_headers(host, headers);
+    }
+
+    pub async fn plaintext_credential_injection_enabled(&self) -> Result<bool> {
+        self.reload_if_needed().await?;
+        let guard = self.state.read().await;
+        Ok(guard
+            .config
+            .network
+            .dangerously_allow_plaintext_credential_injection)
     }
 
     pub async fn current_cfg(&self) -> Result<NetworkProxyConfig> {
@@ -317,6 +350,7 @@ impl NetworkProxyState {
 
         match self.reloader.reload_now().await {
             Ok(mut new_state) => {
+                self.ensure_credential_broker_enablement_unchanged(&new_state)?;
                 // Policy changes are operationally sensitive; logging diffs makes changes traceable
                 // without needing to dump full config blobs (which can include unrelated settings).
                 log_policy_changes(&previous_cfg, &new_state.config);
@@ -339,6 +373,7 @@ impl NetworkProxyState {
 
     pub async fn replace_config_state(&self, mut new_state: ConfigState) -> Result<()> {
         self.reload_if_needed().await?;
+        self.ensure_credential_broker_enablement_unchanged(&new_state)?;
         let mut guard = self.state.write().await;
         log_policy_changes(&guard.config, &new_state.config);
         new_state.blocked = guard.blocked.clone();
@@ -585,6 +620,32 @@ impl NetworkProxyState {
         Ok(guard.mitm.clone())
     }
 
+    pub(crate) async fn evaluate_mitm_hook_request(
+        &self,
+        host: &str,
+        req: &rama_http::Request,
+    ) -> Result<HookEvaluation> {
+        self.reload_if_needed().await?;
+        let guard = self.state.read().await;
+        Ok(evaluate_mitm_hooks(&guard.mitm_hooks, host, req))
+    }
+
+    pub(crate) async fn host_mitm_requirement(&self, host: &str) -> Result<HostMitmRequirement> {
+        self.reload_if_needed().await?;
+        let normalized_host = normalize_host(host);
+        let host_has_mitm_hooks = {
+            let guard = self.state.read().await;
+            guard.mitm_hooks.contains_key(&normalized_host)
+        };
+        Ok(if host_has_mitm_hooks {
+            HostMitmRequirement::Always
+        } else if self.credential_broker.host_requires_mitm(&normalized_host) {
+            HostMitmRequirement::Tls
+        } else {
+            HostMitmRequirement::None
+        })
+    }
+
     pub async fn add_allowed_domain(&self, host: &str) -> Result<()> {
         self.update_domain_list(host, DomainListKind::Allow).await
     }
@@ -656,6 +717,7 @@ impl NetworkProxyState {
         match self.reloader.maybe_reload().await? {
             None => Ok(()),
             Some(mut new_state) => {
+                self.ensure_credential_broker_enablement_unchanged(&new_state)?;
                 let (previous_cfg, blocked, blocked_total) = {
                     let guard = self.state.read().await;
                     (
@@ -676,6 +738,14 @@ impl NetworkProxyState {
                 Ok(())
             }
         }
+    }
+
+    fn ensure_credential_broker_enablement_unchanged(&self, new_state: &ConfigState) -> Result<()> {
+        anyhow::ensure!(
+            self.credential_broker.enabled() == new_state.config.network.credential_broker,
+            "network.credential_broker cannot change while the proxy is running"
+        );
+        Ok(())
     }
 }
 
@@ -846,9 +916,23 @@ pub(crate) fn network_proxy_state_for_policy(
     mut network: crate::config::NetworkProxySettings,
 ) -> NetworkProxyState {
     network.enabled = true;
-    network.mode = NetworkMode::Full;
     let config = NetworkProxyConfig { network };
-    let state = build_config_state(config, NetworkProxyConstraints::default()).unwrap();
+    let state = ConfigState {
+        allow_set: crate::policy::compile_allowlist_globset(
+            &config.network.allowed_domains().unwrap_or_default(),
+        )
+        .unwrap(),
+        blocked: VecDeque::new(),
+        blocked_total: 0,
+        config: config.clone(),
+        constraints: NetworkProxyConstraints::default(),
+        deny_set: crate::policy::compile_denylist_globset(
+            &config.network.denied_domains().unwrap_or_default(),
+        )
+        .unwrap(),
+        mitm: None,
+        mitm_hooks: crate::mitm_hook::compile_mitm_hooks(&config).unwrap(),
+    };
 
     NetworkProxyState::with_reloader(state, Arc::new(NoopReloader))
 }
@@ -857,18 +941,17 @@ pub(crate) fn network_proxy_state_for_policy(
 struct NoopReloader;
 
 #[cfg(test)]
-#[async_trait]
 impl ConfigReloader for NoopReloader {
     fn source_label(&self) -> String {
         "test config state".to_string()
     }
 
-    async fn maybe_reload(&self) -> Result<Option<ConfigState>> {
-        Ok(None)
+    fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>> {
+        Box::pin(async { Ok(None) })
     }
 
-    async fn reload_now(&self) -> Result<ConfigState> {
-        Err(anyhow::anyhow!("force reload is not supported in tests"))
+    fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState> {
+        Box::pin(async { Err(anyhow::anyhow!("force reload is not supported in tests")) })
     }
 }
 
@@ -884,6 +967,27 @@ mod tests {
     use crate::state::build_config_state;
     use crate::state::validate_policy_against_constraints;
     use pretty_assertions::assert_eq;
+
+    #[derive(Clone)]
+    struct StaticReloader {
+        state: ConfigState,
+    }
+
+    impl ConfigReloader for StaticReloader {
+        fn source_label(&self) -> String {
+            "static test reloader".to_string()
+        }
+
+        fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<ConfigState>> {
+            let state = self.state.clone();
+            Box::pin(async move { Ok(Some(state)) })
+        }
+
+        fn reload_now(&self) -> ConfigReloaderFuture<'_, ConfigState> {
+            let state = self.state.clone();
+            Box::pin(async move { Ok(state) })
+        }
+    }
 
     fn strings(entries: &[&str]) -> Vec<String> {
         entries.iter().map(|entry| (*entry).to_string()).collect()
@@ -910,6 +1014,40 @@ mod tests {
             network.set_allow_unix_sockets(unix_sockets.to_vec());
         }
         network
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_credential_broker_enablement_changes() {
+        let initial_state = build_config_state(
+            NetworkProxyConfig::default(),
+            NetworkProxyConstraints::default(),
+        )
+        .unwrap();
+        let mut reloaded_state = initial_state.clone();
+        reloaded_state
+            .config
+            .set_credential_broker_enabled(/*enabled*/ true);
+        let state = NetworkProxyState::with_reloader(
+            initial_state,
+            Arc::new(StaticReloader {
+                state: reloaded_state,
+            }),
+        );
+
+        let err = state
+            .force_reload()
+            .await
+            .expect_err("credential broker enablement should require a proxy restart");
+        let mut env = HashMap::from([("OPENAI_API_KEY".to_string(), "sk-real".to_string())]);
+        state.virtualize_child_credentials(&mut env);
+
+        assert!(
+            format!("{err:#}")
+                .contains("network.credential_broker cannot change while the proxy is running"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(env["OPENAI_API_KEY"], "sk-real");
+        assert!(!state.credential_broker.enabled());
     }
 
     #[tokio::test]

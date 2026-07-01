@@ -1,40 +1,66 @@
 use std::sync::Arc;
 
-use codex_extension_api::ExtensionToolExecutor;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::ResponsesApiTool;
 use codex_extension_api::ToolCall;
+use codex_extension_api::ToolExecutor;
+use codex_extension_api::ToolName;
 use codex_extension_api::ToolSpec;
 use codex_extension_api::parse_tool_input_schema;
+use codex_otel::MetricsClient;
+use codex_tools::ResponsesApiNamespace;
+use codex_tools::ResponsesApiNamespaceTool;
+use codex_tools::default_namespace_description;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::MEMORY_TOOLS_NAMESPACE;
 use crate::backend::MemoriesBackend;
 use crate::backend::MemoriesBackendError;
 use crate::schema;
 
+mod ad_hoc_note;
 mod list;
 mod read;
 mod search;
 
-pub(crate) fn memory_tools<B>(backend: B) -> Vec<Arc<dyn ExtensionToolExecutor>>
+pub(crate) fn memory_tools<B>(
+    backend: B,
+    metrics_client: Option<MetricsClient>,
+) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>
 where
     B: MemoriesBackend,
 {
     vec![
+        Arc::new(ad_hoc_note::AddAdHocNoteTool {
+            backend: backend.clone(),
+            metrics_client: metrics_client.clone(),
+        }),
         Arc::new(list::ListTool {
             backend: backend.clone(),
+            metrics_client: metrics_client.clone(),
         }),
         Arc::new(read::ReadTool {
             backend: backend.clone(),
+            metrics_client: metrics_client.clone(),
         }),
-        Arc::new(search::SearchTool { backend }),
+        Arc::new(search::SearchTool {
+            backend,
+            metrics_client,
+        }),
     ]
 }
 
-fn function_tool<I: JsonSchema, O: JsonSchema>(name: &str, description: &str) -> ToolSpec {
-    ToolSpec::Function(ResponsesApiTool {
+pub(super) fn memory_tool_name(name: &str) -> ToolName {
+    ToolName::namespaced(MEMORY_TOOLS_NAMESPACE, name)
+}
+
+pub(super) fn memory_function_tool<I: JsonSchema, O: JsonSchema>(
+    name: &str,
+    description: &str,
+) -> ToolSpec {
+    let tool = ResponsesApiTool {
         name: name.to_string(),
         description: description.to_string(),
         strict: false,
@@ -42,6 +68,12 @@ fn function_tool<I: JsonSchema, O: JsonSchema>(name: &str, description: &str) ->
         parameters: parse_tool_input_schema(&schema::input_schema_for::<I>())
             .unwrap_or_else(|err| panic!("generated input schema for {name} should parse: {err}")),
         output_schema: Some(schema::output_schema_for::<O>()),
+    };
+
+    ToolSpec::Namespace(ResponsesApiNamespace {
+        name: MEMORY_TOOLS_NAMESPACE.to_string(),
+        description: default_namespace_description(MEMORY_TOOLS_NAMESPACE),
+        tools: vec![ResponsesApiNamespaceTool::Function(tool)],
     })
 }
 
@@ -64,12 +96,15 @@ fn backend_error_to_function_call(err: MemoriesBackendError) -> FunctionCallErro
     match err {
         MemoriesBackendError::InvalidPath { .. }
         | MemoriesBackendError::InvalidCursor { .. }
+        | MemoriesBackendError::InvalidFilename { .. }
         | MemoriesBackendError::NotFound { .. }
         | MemoriesBackendError::InvalidLineOffset
         | MemoriesBackendError::InvalidMaxLines
         | MemoriesBackendError::LineOffsetExceedsFileLength
         | MemoriesBackendError::NotFile { .. }
         | MemoriesBackendError::EmptyQuery
+        | MemoriesBackendError::EmptyAdHocNote
+        | MemoriesBackendError::AdHocNoteAlreadyExists { .. }
         | MemoriesBackendError::InvalidMatchWindow => {
             FunctionCallError::RespondToModel(err.to_string())
         }

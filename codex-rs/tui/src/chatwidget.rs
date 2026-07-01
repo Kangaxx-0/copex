@@ -10,7 +10,8 @@
 //! visible immediately.
 //!
 //! The transcript overlay is kept in sync by `App::overlay_forward_event`, which syncs a live tail
-//! during draws using `active_cell_transcript_key()` and `active_cell_transcript_lines()`. The
+//! during draws using `active_cell_transcript_key()` and
+//! `active_cell_transcript_hyperlink_lines()`. The
 //! cache key is designed to change when the active cell mutates in place or when its transcript
 //! output is time-dependent so the overlay can refresh its cached tail without rebuilding it on
 //! every draw.
@@ -43,12 +44,9 @@ use std::time::Instant;
 use crate::app::app_server_requests::ResolvedAppServerRequest;
 use crate::app_command::AppCommand;
 use crate::app_event::HistoryLookupResponse;
-use crate::app_event::RealtimeAudioDeviceKind;
 use crate::app_server_approval_conversions::file_update_changes_to_display;
 use crate::approval_events::ApplyPatchApprovalRequestEvent;
 use crate::approval_events::ExecApprovalRequestEvent;
-#[cfg(not(target_os = "linux"))]
-use crate::audio_device::list_realtime_audio_device_names;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::StatusLineSetupView;
 use crate::bottom_pane::StatusSurfacePreviewData;
@@ -57,12 +55,8 @@ use crate::bottom_pane::TerminalTitleItem;
 use crate::bottom_pane::TerminalTitleSetupView;
 use crate::diff_model::FileChange;
 use crate::git_action_directives::parse_assistant_markdown;
-use crate::legacy_core::DEFAULT_AGENTS_MD_FILENAME;
 use crate::legacy_core::config::Config;
-use crate::legacy_core::config::Constrained;
-use crate::legacy_core::config::ConstraintResult;
-#[cfg(target_os = "windows")]
-use crate::legacy_core::windows_sandbox::WindowsSandboxLevelExt;
+use crate::legacy_core::config::PermissionProfileSnapshot;
 use crate::mention_codec::LinkedMention;
 use crate::mention_codec::encode_history_mentions;
 use crate::model_catalog::ModelCatalog;
@@ -76,6 +70,7 @@ use crate::status::StatusHistoryHandle;
 use crate::status::format_directory_display;
 use crate::status::format_tokens_compact;
 use crate::status::rate_limit_snapshot_display_for_limit;
+use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_title::SetTerminalTitleResult;
 use crate::terminal_title::clear_terminal_title;
 use crate::terminal_title::set_terminal_title;
@@ -85,14 +80,12 @@ use crate::token_usage::TokenUsageInfo;
 use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
-use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::AppSummary;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
-use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::CreditsSnapshot;
 use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
@@ -114,6 +107,8 @@ use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadGoal as AppThreadGoal;
 use codex_app_server_protocol::ThreadGoalStatus as AppThreadGoalStatus;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadSettings;
+use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::ToolRequestUserInputParams;
 use codex_app_server_protocol::Turn;
@@ -121,13 +116,14 @@ use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnPlanStepStatus;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
-use codex_chatgpt::connectors as chatgpt_connectors;
 use codex_config::ConfigLayerStackOrdering;
+use codex_config::Constrained;
+use codex_config::ConstraintResult;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::Notifications;
 use codex_config::types::WindowsSandboxModeToml;
+use codex_connectors::AppInfo;
 use codex_core_skills::model::SkillMetadata;
-use codex_exec_server::EnvironmentManager;
 use codex_features::FEATURES;
 use codex_features::Feature;
 #[cfg(test)]
@@ -150,7 +146,7 @@ use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::Settings;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
@@ -165,6 +161,10 @@ use codex_terminal_detection::TerminalInfo;
 use codex_terminal_detection::TerminalName;
 use codex_terminal_detection::terminal_info;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_cli::resume_hint;
+use codex_utils_path_uri::PathUri;
+use codex_utils_plugins::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
+use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -251,8 +251,14 @@ fn queued_message_edit_hint_binding(
         .or_else(|| bindings.first().copied())
 }
 
+fn normalize_thread_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
+use crate::app_event::PermissionProfileSelection;
 use crate::app_event::RateLimitRefreshOrigin;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
@@ -269,6 +275,7 @@ use crate::bottom_pane::DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED;
 use crate::bottom_pane::ExperimentalFeatureItem;
 use crate::bottom_pane::ExperimentalFeaturesView;
 use crate::bottom_pane::GoalStatusIndicator;
+use crate::bottom_pane::HistoryEntry;
 use crate::bottom_pane::InputResult;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::McpServerElicitationFormRequest;
@@ -311,12 +318,14 @@ use crate::render::renderable::RenderableExt;
 use crate::render::renderable::RenderableItem;
 use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
+use crate::status::remote_connection::RemoteConnectionStatus;
 use crate::status_indicator_widget::STATUS_DETAILS_DEFAULT_MAX_LINES;
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 mod command_lifecycle;
 mod connectors;
+mod constructor;
 use self::connectors::ConnectorsState;
 mod exec_state;
 use self::exec_state::RunningCommand;
@@ -331,7 +340,6 @@ use self::goal_status::GoalStatusState;
 #[cfg(test)]
 use self::goal_status::goal_status_indicator_from_app_goal;
 mod goal_menu;
-mod goal_validation;
 mod ide_context;
 use self::ide_context::IdeContextState;
 mod input_queue;
@@ -345,15 +353,19 @@ mod keymap_picker;
 mod mcp_startup;
 use self::mcp_startup::McpStartupStatus;
 mod pets;
+mod session_flow;
 mod session_header;
 use self::session_header::SessionHeader;
 mod hook_lifecycle;
 mod hooks;
+mod interaction;
 mod skills;
 mod slash_dispatch;
 use self::skills::collect_tool_mentions;
 use self::skills::find_app_mentions;
 use self::skills::find_skill_mentions_with_tool_mentions;
+use self::skills::is_app_mentionable;
+mod plugin_catalog;
 mod plugins;
 use self::plugins::PluginInstallAuthFlowState;
 use self::plugins::PluginListFetchState;
@@ -361,7 +373,10 @@ use self::plugins::PluginsCacheState;
 mod plan_implementation;
 use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
 mod model_popups;
+mod notifications;
+use self::notifications::Notification;
 mod permission_popups;
+mod permissions_menu;
 mod protocol;
 mod protocol_requests;
 mod rate_limits;
@@ -369,18 +384,23 @@ use self::rate_limits::RateLimitErrorKind;
 use self::rate_limits::RateLimitSwitchPromptState;
 use self::rate_limits::RateLimitWarningState;
 use self::rate_limits::app_server_rate_limit_error_kind;
-pub(crate) use self::rate_limits::get_limits_duration;
+pub(crate) use self::rate_limits::fallback_limit_label;
 use self::rate_limits::is_app_server_cyber_policy_error;
-mod realtime;
-mod replay;
-use self::realtime::RealtimeConversationUiState;
+pub(crate) use self::rate_limits::limit_label_for_window;
 mod reasoning_shortcuts;
+mod rendering;
+mod replay;
 mod review;
+mod review_popups;
 use self::review::ReviewState;
+#[cfg(test)]
+pub(crate) use self::review_popups::show_review_commit_picker_with_entries;
+mod safety_buffering;
 mod service_tiers;
 mod settings;
 mod settings_popups;
 mod side;
+use self::safety_buffering::SafetyBufferingState;
 mod status_state;
 mod windows_sandbox_prompts;
 use self::status_state::StatusIndicatorState;
@@ -390,6 +410,8 @@ mod status_controls;
 mod status_surfaces;
 mod streaming;
 use self::status_surfaces::CachedProjectRootName;
+mod tokens;
+pub(crate) use self::tokens::TokenActivityView;
 mod tool_lifecycle;
 mod tool_requests;
 mod transcript;
@@ -397,6 +419,7 @@ use self::transcript::TranscriptState;
 mod turn_lifecycle;
 mod turn_runtime;
 use self::turn_lifecycle::TurnLifecycleState;
+mod usage;
 mod user_messages;
 use self::user_messages::PendingSteer;
 use self::user_messages::PendingSteerCompareKey;
@@ -432,6 +455,7 @@ use crate::workspace_command::WorkspaceCommandRunner;
 use chrono::Local;
 use codex_app_server_protocol::AskForApproval;
 use codex_file_search::FileMatch;
+use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelPreset;
@@ -445,6 +469,9 @@ use unicode_segmentation::UnicodeSegmentation;
 
 const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
 const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
+const ASK_FOR_APPROVAL_LABEL: &str = "Ask for approval";
+const APPROVE_FOR_ME_LABEL: &str = "Approve for me";
+const AUTO_REVIEW_DESCRIPTION: &str = "Only ask for actions detected as potentially unsafe.";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 2] = ["model-with-reasoning", "current-dir"];
 const MAX_AGENT_COPY_HISTORY: usize = 32;
@@ -452,7 +479,6 @@ const MAX_AGENT_COPY_HISTORY: usize = 32;
 /// Common initialization parameters shared by all `ChatWidget` constructors.
 pub(crate) struct ChatWidgetInit {
     pub(crate) config: Config,
-    pub(crate) environment_manager: Arc<EnvironmentManager>,
     pub(crate) frame_requester: FrameRequester,
     pub(crate) app_event_tx: AppEventSender,
     /// App-server-backed runner used by status surfaces for workspace metadata probes.
@@ -463,6 +489,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) initial_user_message: Option<UserMessage>,
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) has_chatgpt_account: bool,
+    pub(crate) has_codex_backend_auth: bool,
     pub(crate) model_catalog: Arc<ModelCatalog>,
     pub(crate) feedback: codex_feedback::CodexFeedback,
     pub(crate) is_first_run: bool,
@@ -504,7 +531,6 @@ pub(crate) struct ChatWidget {
     bottom_pane: BottomPane,
     transcript: TranscriptState,
     config: Config,
-    environment_manager: Arc<EnvironmentManager>,
     raw_output_mode: bool,
     /// Runtime value resolved by core. `config.service_tier` remains the explicit user choice.
     effective_service_tier: Option<String>,
@@ -515,16 +541,27 @@ pub(crate) struct ChatWidget {
     /// The currently active collaboration mask, if any.
     active_collaboration_mask: Option<CollaborationModeMask>,
     has_chatgpt_account: bool,
+    has_codex_backend_auth: bool,
     model_catalog: Arc<ModelCatalog>,
     session_telemetry: SessionTelemetry,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     status_account_display: Option<StatusAccountDisplay>,
     runtime_model_provider_base_url: Option<String>,
+    pub(crate) remote_connection: Option<RemoteConnectionStatus>,
     token_info: Option<TokenUsageInfo>,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
     next_status_refresh_request_id: u64,
+    refreshing_token_activity_output: Option<tokens::PendingTokenActivityOutput>,
+    completed_token_activity_output: Option<history_cell::CompositeHistoryCell>,
+    next_token_activity_request_id: u64,
+    pending_rate_limit_reset_request_id: Option<u64>,
+    pending_rate_limit_reset_hint_request_id: Option<u64>,
+    pending_usage_menu_rate_limit_request_id: Option<u64>,
+    pending_rate_limit_reset_hint: Option<PlainHistoryCell>,
+    available_rate_limit_reset_credits: Option<i64>,
+    next_rate_limit_reset_request_id: u64,
     plan_type: Option<PlanType>,
     codex_rate_limit_reached_type: Option<RateLimitReachedType>,
     rate_limit_warnings: RateLimitWarningState,
@@ -536,6 +573,7 @@ pub(crate) struct ChatWidget {
     stream_controller: Option<StreamController>,
     // Stream lifecycle controller for proposed plan output.
     plan_stream_controller: Option<PlanStreamController>,
+    pending_stream_consolidations: usize,
     /// Holds the platform clipboard lease so copied text remains available while supported.
     clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
     copy_last_response_binding: Vec<KeyBinding>,
@@ -548,6 +586,7 @@ pub(crate) struct ChatWidget {
     last_unified_wait: Option<UnifiedExecWaitState>,
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
     turn_lifecycle: TurnLifecycleState,
+    safety_buffering: SafetyBufferingState,
     task_complete_pending: bool,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
     /// Tracks per-server MCP startup state while startup is in progress.
@@ -571,6 +610,9 @@ pub(crate) struct ChatWidget {
     ide_context: IdeContextState,
     plugins_cache: PluginsCacheState,
     plugins_fetch_state: PluginListFetchState,
+    plugin_remote_sections_loading: bool,
+    plugin_remote_sections_loaded: bool,
+    plugin_remote_section_errors: Vec<crate::app_event::PluginRemoteSectionError>,
     plugin_install_apps_needing_auth: Vec<AppSummary>,
     plugin_install_auth_flow: Option<PluginInstallAuthFlowState>,
     plugins_active_tab_id: Option<String>,
@@ -620,6 +662,7 @@ pub(crate) struct ChatWidget {
     // order.
     suppress_initial_user_message_submit: bool,
     input_queue: InputQueueState,
+    cancel_edit: CancelEditState,
     /// Main chat-surface bindings resolved from `tui.keymap.chat`.
     chat_keymap: ChatKeymap,
     /// Keybinding to show for popping the most-recently queued message back
@@ -648,7 +691,7 @@ pub(crate) struct ChatWidget {
     // App-server-backed command runner for status-line workspace metadata lookups.
     workspace_command_runner: Option<WorkspaceCommandRunner>,
     // Instruction source files loaded for the current session, supplied by app-server.
-    instruction_source_paths: Vec<AbsolutePathBuf>,
+    instruction_source_paths: Vec<PathUri>,
     // Runtime network proxy bind addresses from SessionConfigured.
     session_network_proxy: Option<SessionNetworkProxyRuntime>,
     // Shared latch so we only warn once about invalid status-line item IDs.
@@ -687,11 +730,20 @@ pub(crate) struct ChatWidget {
     status_line_git_summary_pending: bool,
     // True once we've attempted a Git summary lookup for the current CWD.
     status_line_git_summary_lookup_complete: bool,
+    // Cached workspace notification headline for the status line.
+    status_line_workspace_headline: Option<String>,
+    // Request ID for the async workspace headline fetch currently in flight.
+    status_line_workspace_headline_pending_request_id: Option<u64>,
+    // Request ID to assign to the next workspace headline fetch.
+    next_status_line_workspace_headline_request_id: u64,
+    // Last time a workspace headline fetch was requested.
+    status_line_workspace_headline_last_requested_at: Option<Instant>,
+    // Set after the backend reports the workspace-message feature gate is disabled.
+    status_line_workspace_messages_disabled: bool,
     // Current thread-goal status shown in the status line when plan mode is inactive.
     current_goal_status_indicator: Option<GoalStatusIndicator>,
     current_goal_status: Option<GoalStatusState>,
     external_editor_state: ExternalEditorState,
-    realtime_conversation: RealtimeConversationUiState,
     last_rendered_user_message_display: Option<UserMessageDisplay>,
     last_non_retry_error: Option<(String, String)>,
 }
@@ -731,6 +783,13 @@ pub(crate) enum InterruptedTurnNoticeMode {
     #[default]
     Default,
     Suppress,
+}
+
+#[derive(Debug, Default)]
+struct CancelEditState {
+    prompt: Option<UserMessage>,
+    eligible: bool,
+    armed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -795,6 +854,12 @@ fn exec_approval_request_from_params(
     params: CommandExecutionRequestApprovalParams,
     fallback_cwd: &AbsolutePathBuf,
 ) -> ExecApprovalRequestEvent {
+    // TODO(anp): Keep this as PathUri once `tui::approval_events::ExecApprovalRequestEvent` and
+    // approval rendering support foreign paths.
+    let cwd = params
+        .cwd
+        .and_then(|cwd| cwd.to_inferred_abs_path())
+        .unwrap_or_else(|| fallback_cwd.clone());
     ExecApprovalRequestEvent {
         call_id: params.item_id,
         command: params
@@ -802,12 +867,13 @@ fn exec_approval_request_from_params(
             .as_deref()
             .map(split_command_string)
             .unwrap_or_default(),
-        cwd: params.cwd.unwrap_or_else(|| fallback_cwd.clone()),
+        cwd,
         reason: params.reason,
         network_approval_context: params.network_approval_context,
         additional_permissions: params.additional_permissions,
         turn_id: params.turn_id,
         approval_id: params.approval_id,
+        environment_id: params.environment_id,
         proposed_execpolicy_amendment: params.proposed_execpolicy_amendment,
         proposed_network_policy_amendments: params.proposed_network_policy_amendments,
         available_decisions: params.available_decisions,
@@ -828,15 +894,16 @@ fn patch_approval_request_from_params(
 
 fn request_permissions_from_params(
     params: codex_app_server_protocol::PermissionsRequestApprovalParams,
-) -> RequestPermissionsEvent {
-    RequestPermissionsEvent {
+) -> std::io::Result<RequestPermissionsEvent> {
+    Ok(RequestPermissionsEvent {
         turn_id: params.turn_id,
         call_id: params.item_id,
+        environment_id: params.environment_id,
         started_at_ms: params.started_at_ms,
         reason: params.reason,
-        permissions: params.permissions.into(),
+        permissions: params.permissions.try_into()?,
         cwd: Some(params.cwd),
-    }
+    })
 }
 
 fn token_usage_info_from_app_server(token_usage: ThreadTokenUsage) -> TokenUsageInfo {
@@ -889,15 +956,6 @@ impl ChatWidget {
             .unwrap_or_default()
     }
 
-    fn realtime_conversation_enabled(&self) -> bool {
-        self.config.features.enabled(Feature::RealtimeConversation)
-            && cfg!(not(target_os = "linux"))
-    }
-
-    fn realtime_audio_device_selection_enabled(&self) -> bool {
-        self.realtime_conversation_enabled()
-    }
-
     fn restore_retry_status_header_if_present(&mut self) {
         if let Some(header) = self.status_state.take_retry_status_header() {
             self.set_status_header(header);
@@ -913,205 +971,6 @@ impl ChatWidget {
 
     fn record_visible_user_turn_for_copy(&mut self) {
         self.transcript.record_visible_user_turn();
-    }
-
-    // --- Small event handlers ---
-    fn on_session_configured_with_display_and_fork_parent_title(
-        &mut self,
-        session: ThreadSessionState,
-        display: SessionConfiguredDisplay,
-        fork_parent_title: Option<String>,
-    ) {
-        self.transcript.reset_copy_history();
-        let history_metadata = session.message_history.unwrap_or_default();
-        self.bottom_pane.set_history_metadata(
-            session.thread_id,
-            history_metadata.log_id,
-            history_metadata.entry_count,
-        );
-        self.set_skills(/*skills*/ None);
-        self.session_network_proxy = session.network_proxy.clone();
-        let previous_thread_id = self.thread_id;
-        self.thread_id = Some(session.thread_id);
-        if previous_thread_id != self.thread_id {
-            self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
-        }
-        self.refresh_plan_mode_nudge();
-        self.turn_lifecycle.reset_thread();
-        self.thread_name = session.thread_name.clone();
-        self.current_goal_status_indicator = None;
-        self.current_goal_status = None;
-        self.update_collaboration_mode_indicator();
-        self.forked_from = session.forked_from_id;
-        self.current_rollout_path = session.rollout_path.clone();
-        self.current_cwd = Some(session.cwd.to_path_buf());
-        self.config.cwd = session.cwd.clone();
-        self.effective_service_tier = session.service_tier.clone();
-        if let Err(err) = self
-            .config
-            .permissions
-            .approval_policy
-            .set(session.approval_policy.to_core())
-        {
-            tracing::warn!(%err, "failed to sync approval_policy from SessionConfigured");
-            self.config.permissions.approval_policy =
-                Constrained::allow_only(session.approval_policy.to_core());
-        }
-        let permission_sync = self
-            .config
-            .permissions
-            .set_permission_profile_with_active_profile(
-                session.permission_profile.clone(),
-                session.active_permission_profile.clone(),
-            );
-        if let Err(err) = permission_sync {
-            tracing::warn!(%err, "failed to sync permissions from SessionConfigured");
-            self.config.permissions.permission_profile =
-                Constrained::allow_only(session.permission_profile.clone());
-            self.config.permissions.active_permission_profile =
-                session.active_permission_profile.clone();
-        }
-        self.config.approvals_reviewer = session.approvals_reviewer;
-        self.status_line_project_root_name_cache = None;
-        let forked_from_id = session.forked_from_id;
-        let model_for_header = session.model.clone();
-        self.session_header.set_model(&model_for_header);
-        self.current_collaboration_mode = self.current_collaboration_mode.with_updates(
-            Some(model_for_header.clone()),
-            Some(session.reasoning_effort),
-            /*developer_instructions*/ None,
-        );
-        if let Some(mask) = self.active_collaboration_mask.as_mut() {
-            mask.model = Some(model_for_header.clone());
-            mask.reasoning_effort = Some(session.reasoning_effort);
-        }
-        self.refresh_model_display();
-        self.refresh_status_surfaces();
-        self.sync_service_tier_commands();
-        self.sync_personality_command_enabled();
-        self.sync_plugins_command_enabled();
-        self.sync_goal_command_enabled();
-        self.refresh_plugin_mentions();
-        if display == SessionConfiguredDisplay::Normal {
-            let startup_tooltip_override = self.startup_tooltip_override.take();
-            let show_fast_status = self
-                .should_show_fast_status(&model_for_header, self.effective_service_tier.as_deref());
-            let session_info_cell = history_cell::new_session_info(
-                &self.config,
-                &model_for_header,
-                &session,
-                self.show_welcome_banner,
-                startup_tooltip_override,
-                self.plan_type,
-                show_fast_status,
-            );
-            self.apply_session_info_cell(session_info_cell);
-        } else if self
-            .transcript
-            .active_cell
-            .as_ref()
-            .is_some_and(|cell| cell.as_any().is::<history_cell::SessionHeaderHistoryCell>())
-        {
-            self.transcript.active_cell = None;
-            self.bump_active_cell_revision();
-        }
-        self.transcript.saw_copy_source_this_turn = false;
-        self.refresh_skills_for_current_cwd(/*force_reload*/ true);
-        if self.connectors_enabled() {
-            self.prefetch_connectors();
-        }
-        if let Some(user_message) = self.initial_user_message.take() {
-            if self.suppress_initial_user_message_submit {
-                self.initial_user_message = Some(user_message);
-            } else {
-                self.submit_user_message(user_message);
-            }
-        }
-        if display == SessionConfiguredDisplay::Normal
-            && let Some(forked_from_id) = forked_from_id
-        {
-            self.emit_forked_thread_event(forked_from_id, fork_parent_title);
-        }
-        if !self.suppress_session_configured_redraw {
-            self.request_redraw();
-        }
-    }
-
-    pub(crate) fn handle_thread_session(&mut self, session: ThreadSessionState) {
-        self.instruction_source_paths = session.instruction_source_paths.clone();
-        let fork_parent_title = session.fork_parent_title.clone();
-        self.on_session_configured_with_display_and_fork_parent_title(
-            session,
-            SessionConfiguredDisplay::Normal,
-            fork_parent_title,
-        );
-    }
-
-    pub(crate) fn handle_thread_session_quiet(&mut self, session: ThreadSessionState) {
-        self.instruction_source_paths = session.instruction_source_paths.clone();
-        self.on_session_configured_with_display_and_fork_parent_title(
-            session,
-            SessionConfiguredDisplay::Quiet,
-            /*fork_parent_title*/ None,
-        );
-    }
-
-    pub(crate) fn handle_side_thread_session(&mut self, session: ThreadSessionState) {
-        self.instruction_source_paths = session.instruction_source_paths.clone();
-        let fork_parent_title = session.fork_parent_title.clone();
-        self.on_session_configured_with_display_and_fork_parent_title(
-            session,
-            SessionConfiguredDisplay::SideConversation,
-            fork_parent_title,
-        );
-    }
-
-    fn emit_forked_thread_event(
-        &mut self,
-        forked_from_id: ThreadId,
-        fork_parent_title: Option<String>,
-    ) {
-        let forked_from_id_text = forked_from_id.to_string();
-        let line: Line<'static> = if let Some(name) = fork_parent_title
-            && !name.trim().is_empty()
-        {
-            vec![
-                "• ".dim(),
-                "Thread forked from ".into(),
-                name.cyan(),
-                " (".into(),
-                forked_from_id_text.cyan(),
-                ")".into(),
-            ]
-            .into()
-        } else {
-            vec![
-                "• ".dim(),
-                "Thread forked from ".into(),
-                forked_from_id_text.cyan(),
-            ]
-            .into()
-        };
-        self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
-            PlainHistoryCell::new(vec![line]),
-        )));
-    }
-
-    fn on_thread_name_updated(&mut self, thread_id: ThreadId, thread_name: Option<String>) {
-        if self.thread_id == Some(thread_id) {
-            if let Some(name) = thread_name.as_deref() {
-                let cell = Self::rename_confirmation_cell(name, self.thread_id);
-                self.add_boxed_history(Box::new(cell));
-            }
-            self.thread_name = thread_name;
-            self.refresh_status_surfaces();
-            self.request_redraw();
-            self.maybe_send_next_queued_input();
-        }
-    }
-
-    fn set_skills(&mut self, skills: Option<Vec<SkillMetadata>>) {
-        self.bottom_pane.set_skills(skills);
     }
 
     pub(crate) fn open_feedback_note(
@@ -1159,12 +1018,19 @@ impl ChatWidget {
 
     pub(crate) fn open_feedback_consent(&mut self, category: crate::app_event::FeedbackCategory) {
         let snapshot = self.feedback.snapshot(self.thread_id);
+        #[cfg(target_os = "windows")]
+        let include_windows_sandbox_log =
+            codex_windows_sandbox::current_log_file_path_for_codex_home(&self.config.codex_home)
+                .is_file();
+        #[cfg(not(target_os = "windows"))]
+        let include_windows_sandbox_log = false;
         let params = crate::bottom_pane::feedback_upload_consent_params(
             self.app_event_tx.clone(),
             category,
             self.current_rollout_path.clone(),
             self.thread_id
                 .map(|thread_id| format!("auto-review-rollout-{thread_id}.jsonl")),
+            include_windows_sandbox_log,
             snapshot.feedback_diagnostics(),
         );
         self.bottom_pane.show_selection_view(params);
@@ -1335,603 +1201,14 @@ impl ChatWidget {
         {
             self.refresh_terminal_title();
         }
-    }
-
-    pub(crate) fn new_with_app_event(common: ChatWidgetInit) -> Self {
-        Self::new_with_op_target(common, CodexOpTarget::AppEvent)
-    }
-
-    fn new_with_op_target(common: ChatWidgetInit, codex_op_target: CodexOpTarget) -> Self {
-        let ChatWidgetInit {
-            config,
-            environment_manager,
-            frame_requester,
-            app_event_tx,
-            workspace_command_runner,
-            initial_user_message,
-            enhanced_keys_supported,
-            has_chatgpt_account,
-            model_catalog,
-            feedback,
-            is_first_run,
-            status_account_display,
-            runtime_model_provider_base_url,
-            initial_plan_type,
-            model,
-            startup_tooltip_override,
-            status_line_invalid_items_warned,
-            terminal_title_invalid_items_warned,
-            session_telemetry,
-        } = common;
-        let model = model.filter(|m| !m.trim().is_empty());
-        let mut config = config;
-        config.model = model.clone();
-        let prevent_idle_sleep = config.features.enabled(Feature::PreventIdleSleep);
-        let mut rng = rand::rng();
-        let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
-        let side_placeholder =
-            SIDE_PLACEHOLDERS[rng.random_range(0..SIDE_PLACEHOLDERS.len())].to_string();
-
-        let model_override = model.as_deref();
-        let model_for_header = model
-            .clone()
-            .unwrap_or_else(|| DEFAULT_MODEL_DISPLAY_NAME.to_string());
-        let active_collaboration_mask =
-            Self::initial_collaboration_mask(&config, model_catalog.as_ref(), model_override);
-        let header_model = active_collaboration_mask
-            .as_ref()
-            .and_then(|mask| mask.model.clone())
-            .unwrap_or_else(|| model_for_header.clone());
-        let fallback_default = Settings {
-            model: header_model.clone(),
-            reasoning_effort: None,
-            developer_instructions: None,
-        };
-        // Collaboration modes start in Default mode.
-        let current_collaboration_mode = CollaborationMode {
-            mode: ModeKind::Default,
-            settings: fallback_default,
-        };
-
-        let active_cell = Some(Self::placeholder_session_header_cell(&config));
-
-        let current_cwd = Some(config.cwd.to_path_buf());
-        let effective_service_tier = config.service_tier.clone();
-        let current_terminal_info = terminal_info();
-        let runtime_keymap = RuntimeKeymap::from_config(&config.tui_keymap).ok();
-        let default_keymap = RuntimeKeymap::defaults();
-        let copy_last_response_binding = runtime_keymap
-            .as_ref()
-            .map(|keymap| keymap.app.copy.clone())
-            .unwrap_or_else(|| default_keymap.app.copy.clone());
-        let chat_keymap = runtime_keymap
-            .as_ref()
-            .map(|keymap| keymap.chat.clone())
-            .unwrap_or_else(|| default_keymap.chat.clone());
-        let queued_message_edit_hint_binding = queued_message_edit_hint_binding(
-            &chat_keymap.edit_queued_message,
-            current_terminal_info,
-        );
-        pets::start_configured_pet_load_if_needed(
-            &config,
-            /*ambient_pet_missing*/ true,
-            frame_requester.clone(),
-            app_event_tx.clone(),
-        );
-        let mut widget = Self {
-            app_event_tx: app_event_tx.clone(),
-            frame_requester: frame_requester.clone(),
-            codex_op_target,
-            bottom_pane: BottomPane::new(BottomPaneParams {
-                frame_requester,
-                app_event_tx,
-                has_input_focus: true,
-                enhanced_keys_supported,
-                placeholder_text: placeholder.clone(),
-                disable_paste_burst: config.disable_paste_burst,
-                animations_enabled: config.animations,
-                skills: None,
-            }),
-            transcript: TranscriptState::new(active_cell),
-            raw_output_mode: config.tui_raw_output_mode,
-            config,
-            environment_manager,
-            effective_service_tier,
-            skills_all: Vec::new(),
-            skills_initial_state: None,
-            current_collaboration_mode,
-            active_collaboration_mask,
-            has_chatgpt_account,
-            model_catalog,
-            session_telemetry,
-            session_header: SessionHeader::new(header_model),
-            initial_user_message,
-            status_account_display,
-            runtime_model_provider_base_url,
-            token_info: None,
-            rate_limit_snapshots_by_limit_id: BTreeMap::new(),
-            refreshing_status_outputs: Vec::new(),
-            next_status_refresh_request_id: 0,
-            plan_type: initial_plan_type,
-            codex_rate_limit_reached_type: None,
-            rate_limit_warnings: RateLimitWarningState::default(),
-            warning_display_state: WarningDisplayState::default(),
-            rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
-            add_credits_nudge_email_in_flight: None,
-            adaptive_chunking: AdaptiveChunkingPolicy::default(),
-            stream_controller: None,
-            plan_stream_controller: None,
-            clipboard_lease: None,
-            copy_last_response_binding,
-            running_commands: HashMap::new(),
-            collab_agent_metadata: HashMap::new(),
-            pending_collab_spawn_requests: HashMap::new(),
-            suppressed_exec_calls: HashSet::new(),
-            last_unified_wait: None,
-            unified_exec_wait_streak: None,
-            turn_lifecycle: TurnLifecycleState::new(prevent_idle_sleep),
-            task_complete_pending: false,
-            unified_exec_processes: Vec::new(),
-            mcp_startup_status: None,
-            mcp_startup_expected_servers: None,
-            mcp_startup_ignore_updates_until_next_start: false,
-            mcp_startup_allow_terminal_only_next_round: false,
-            mcp_startup_pending_next_round: HashMap::new(),
-            mcp_startup_pending_next_round_saw_starting: false,
-            connectors: ConnectorsState::default(),
-            ide_context: IdeContextState::default(),
-            plugins_cache: PluginsCacheState::default(),
-            plugins_fetch_state: PluginListFetchState::default(),
-            plugin_install_apps_needing_auth: Vec::new(),
-            plugin_install_auth_flow: None,
-            plugins_active_tab_id: None,
-            newly_installed_marketplace_tab_id: None,
-            interrupts: InterruptManager::new(),
-            reasoning_buffer: String::new(),
-            full_reasoning_buffer: String::new(),
-            status_state: StatusState::default(),
-            review: ReviewState::default(),
-            active_hook_cell: None,
-            ambient_pet: None,
-            pet_picker_preview_state: crate::pets::PetPickerPreviewState::default(),
-            pet_picker_preview_pet: None,
-            pet_picker_preview_request_id: 0,
-            pet_picker_preview_image_visible: std::cell::Cell::new(/*value*/ false),
-            pet_selection_load_request_id: 0,
-            #[cfg(test)]
-            pet_image_support_override: None,
-            thread_id: None,
-            dismissed_plan_mode_nudge_scopes: HashSet::new(),
-            thread_name: None,
-            thread_rename_block_message: None,
-            active_side_conversation: false,
-            normal_placeholder_text: placeholder,
-            side_placeholder_text: side_placeholder,
-            forked_from: None,
-            interrupted_turn_notice_mode: InterruptedTurnNoticeMode::Default,
-            input_queue: InputQueueState::default(),
-            chat_keymap,
-            queued_message_edit_hint_binding,
-            show_welcome_banner: is_first_run,
-            startup_tooltip_override,
-            suppress_session_configured_redraw: false,
-            suppress_initial_user_message_submit: false,
-            pending_notification: None,
-            quit_shortcut_expires_at: None,
-            quit_shortcut_key: None,
-            turn_runtime_metrics: RuntimeMetricsSummary::default(),
-            last_rendered_width: std::cell::Cell::new(None),
-            feedback,
-            current_rollout_path: None,
-            current_cwd,
-            workspace_command_runner,
-            instruction_source_paths: Vec::new(),
-            session_network_proxy: None,
-            status_line_invalid_items_warned,
-            terminal_title_invalid_items_warned,
-            last_terminal_title: None,
-            last_terminal_title_requires_action: false,
-            terminal_title_setup_original_items: None,
-            terminal_title_animation_origin: Instant::now(),
-            status_line_project_root_name_cache: None,
-            status_line_branch: None,
-            status_line_branch_cwd: None,
-            status_line_branch_pending: false,
-            status_line_branch_lookup_complete: false,
-            status_line_git_summary: None,
-            status_line_git_summary_cwd: None,
-            status_line_git_summary_pending: false,
-            status_line_git_summary_lookup_complete: false,
-            current_goal_status_indicator: None,
-            current_goal_status: None,
-            external_editor_state: ExternalEditorState::Closed,
-            realtime_conversation: RealtimeConversationUiState::default(),
-            last_rendered_user_message_display: None,
-            last_non_retry_error: None,
-        };
-
-        widget.prefetch_rate_limits();
-        if let Some(keymap) = runtime_keymap {
-            widget.bottom_pane.set_keymap_bindings(&keymap);
-        }
-        widget
-            .bottom_pane
-            .set_vim_enabled(widget.config.tui_vim_mode_default);
-        widget
-            .bottom_pane
-            .set_realtime_conversation_enabled(widget.realtime_conversation_enabled());
-        widget
-            .bottom_pane
-            .set_audio_device_selection_enabled(widget.realtime_audio_device_selection_enabled());
-        widget
-            .bottom_pane
-            .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
-        widget
-            .bottom_pane
-            .set_collaboration_modes_enabled(/*enabled*/ true);
-        widget.sync_service_tier_commands();
-        widget.sync_personality_command_enabled();
-        widget.sync_plugins_command_enabled();
-        widget.sync_goal_command_enabled();
-        widget.sync_mentions_v2_enabled();
-        widget
-            .bottom_pane
-            .set_queued_message_edit_binding(widget.queued_message_edit_hint_binding);
-        #[cfg(target_os = "windows")]
-        widget.bottom_pane.set_windows_degraded_sandbox_active(
-            crate::legacy_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
-                && matches!(
-                    WindowsSandboxLevel::from_config(&widget.config),
-                    WindowsSandboxLevel::RestrictedToken
-                ),
-        );
-        widget.update_collaboration_mode_indicator();
-
-        widget
-            .bottom_pane
-            .set_connectors_enabled(widget.connectors_enabled());
-        widget.refresh_status_surfaces();
-
-        widget
-    }
-
-    pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
-        if self.bottom_pane.has_active_view()
-            && !matches!(
-                key_event,
-                KeyEvent {
-                    code: KeyCode::Char(c),
-                    modifiers,
-                    kind: KeyEventKind::Press,
-                    ..
-                } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c')
-            )
-            && !key_hint::ctrl(KeyCode::Char('r')).is_press(key_event)
-            && !key_hint::ctrl(KeyCode::Char('u')).is_press(key_event)
-        {
-            self.bottom_pane.handle_key_event(key_event);
-            if self.bottom_pane.no_modal_or_popup_active() {
-                self.maybe_send_next_queued_input();
-            }
-            return;
-        }
-
-        if self.handle_reasoning_shortcut(key_event) {
-            self.bottom_pane.clear_quit_shortcut_hint();
-            self.quit_shortcut_expires_at = None;
-            self.quit_shortcut_key = None;
-            return;
-        }
-
-        if key_event.kind == KeyEventKind::Press
-            && self.copy_last_response_binding.is_pressed(key_event)
-        {
-            self.bottom_pane.clear_quit_shortcut_hint();
-            self.quit_shortcut_expires_at = None;
-            self.quit_shortcut_key = None;
-            self.copy_last_agent_markdown();
-            return;
-        }
-
-        match key_event {
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                kind: KeyEventKind::Press,
-                ..
-            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c') => {
-                self.on_ctrl_c();
-                return;
-            }
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                kind: KeyEventKind::Press,
-                ..
-            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'d') => {
-                if self.on_ctrl_d() {
-                    return;
-                }
-                self.bottom_pane.clear_quit_shortcut_hint();
-                self.quit_shortcut_expires_at = None;
-                self.quit_shortcut_key = None;
-            }
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                kind: KeyEventKind::Press,
-                ..
-            } if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && c.eq_ignore_ascii_case(&'v') =>
-            {
-                match paste_image_to_temp_png() {
-                    Ok((path, info)) => {
-                        tracing::debug!(
-                            "pasted image size={}x{} format={}",
-                            info.width,
-                            info.height,
-                            info.encoded_format.label()
-                        );
-                        self.attach_image(path);
-                    }
-                    Err(err) => {
-                        tracing::warn!("failed to paste image: {err}");
-                        self.add_to_history(history_cell::new_error_event(format!(
-                            "Failed to paste image: {err}",
-                        )));
-                    }
-                }
-                return;
-            }
-            other if other.kind == KeyEventKind::Press => {
-                self.bottom_pane.clear_quit_shortcut_hint();
-                self.quit_shortcut_expires_at = None;
-                self.quit_shortcut_key = None;
-            }
-            _ => {}
-        }
-
-        if key_event.kind == KeyEventKind::Press
-            && self.chat_keymap.edit_queued_message.is_pressed(key_event)
-            && self.has_queued_follow_up_messages()
-            && self.bottom_pane.no_modal_or_popup_active()
-        {
-            if let Some(user_message) = self.pop_latest_queued_user_message() {
-                self.restore_user_message_to_composer(user_message);
-                self.refresh_pending_input_preview();
-                self.request_redraw();
-            }
-            return;
-        }
-
-        if matches!(key_event.code, KeyCode::Esc)
-            && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && !self.input_queue.pending_steers.is_empty()
-            && self.bottom_pane.is_task_running()
-            && self.bottom_pane.no_modal_or_popup_active()
-            && !self.should_handle_vim_insert_escape(key_event)
-        {
-            self.input_queue.submit_pending_steers_after_interrupt = true;
-            if !self.submit_op(AppCommand::interrupt()) {
-                self.input_queue.submit_pending_steers_after_interrupt = false;
-            }
-            return;
-        }
-
-        if matches!(key_event.code, KeyCode::Esc)
-            && key_event.kind == KeyEventKind::Press
-            && self.should_show_plan_mode_nudge()
-        {
-            self.dismiss_plan_mode_nudge();
-            return;
-        }
-
-        if self.handle_plugins_popup_key_event(key_event) {
-            return;
-        }
-
-        match key_event {
-            KeyEvent {
-                code: KeyCode::BackTab,
-                kind: KeyEventKind::Press,
-                ..
-            } if self.collaboration_modes_enabled()
-                && !self.bottom_pane.is_task_running()
-                && self.bottom_pane.no_modal_or_popup_active() =>
-            {
-                self.cycle_collaboration_mode();
-                self.refresh_plan_mode_nudge();
-            }
-            _ => {
-                let had_modal_or_popup = !self.bottom_pane.no_modal_or_popup_active();
-                let input_result = self.bottom_pane.handle_key_event(key_event);
-                self.handle_composer_input_result(input_result, had_modal_or_popup);
-            }
-        }
-    }
-
-    /// Attach a local image to the composer when the active model supports image inputs.
-    ///
-    /// When the model does not advertise image support, we keep the draft unchanged and surface a
-    /// warning event so users can switch models or remove attachments.
-    pub(crate) fn attach_image(&mut self, path: PathBuf) {
-        if !self.current_model_supports_images() {
-            self.add_to_history(history_cell::new_warning_event(
-                self.image_inputs_not_supported_message(),
-            ));
-            self.request_redraw();
-            return;
-        }
-        tracing::info!("attach_image path={path:?}");
-        self.bottom_pane.attach_image(path);
-        self.request_redraw();
-    }
-
-    pub(crate) fn composer_text_with_pending(&self) -> String {
-        self.bottom_pane.composer_text_with_pending()
-    }
-
-    pub(crate) fn apply_external_edit(&mut self, text: String) {
-        self.bottom_pane.apply_external_edit(text);
-        self.refresh_plan_mode_nudge();
-        self.request_redraw();
-    }
-
-    pub(crate) fn external_editor_state(&self) -> ExternalEditorState {
-        self.external_editor_state
-    }
-
-    pub(crate) fn set_external_editor_state(&mut self, state: ExternalEditorState) {
-        self.external_editor_state = state;
-    }
-
-    pub(crate) fn set_footer_hint_override(&mut self, items: Option<Vec<(String, String)>>) {
-        self.bottom_pane.set_footer_hint_override(items);
-    }
-
-    pub(crate) fn show_selection_view(&mut self, params: SelectionViewParams) {
-        self.bottom_pane.show_selection_view(params);
-        self.refresh_plan_mode_nudge();
-        self.request_redraw();
-    }
-
-    pub(crate) fn no_modal_or_popup_active(&self) -> bool {
-        self.bottom_pane.no_modal_or_popup_active()
-    }
-
-    pub(crate) fn can_launch_external_editor(&self) -> bool {
-        self.bottom_pane.can_launch_external_editor()
-    }
-
-    pub(crate) fn can_run_ctrl_l_clear_now(&mut self) -> bool {
-        // Ctrl+L is not a slash command, but it follows /clear's current rule:
-        // block while a task is running.
-        if !self.bottom_pane.is_task_running() {
-            return true;
-        }
-
-        let message = "Ctrl+L is disabled while a task is in progress.".to_string();
-        self.add_to_history(history_cell::new_error_event(message));
-        self.request_redraw();
-        false
-    }
-
-    /// Copy the last agent response (raw markdown) to the system clipboard.
-    pub(crate) fn copy_last_agent_markdown(&mut self) {
-        self.copy_last_agent_markdown_with(crate::clipboard_copy::copy_to_clipboard);
-    }
-
-    pub(crate) fn truncate_agent_copy_history_to_user_turn_count(
-        &mut self,
-        user_turn_count: usize,
-    ) {
-        self.transcript
-            .truncate_copy_history_to_user_turn_count(user_turn_count);
-    }
-
-    /// Inner implementation with an injectable clipboard backend for testing.
-    fn copy_last_agent_markdown_with(
-        &mut self,
-        copy_fn: impl FnOnce(&str) -> Result<Option<crate::clipboard_copy::ClipboardLease>, String>,
-    ) {
-        match self.transcript.last_agent_markdown.clone() {
-            Some(markdown) if !markdown.is_empty() => match copy_fn(&markdown) {
-                Ok(lease) => {
-                    self.clipboard_lease = lease;
-                    self.add_to_history(history_cell::new_info_event(
-                        "Copied last message to clipboard".into(),
-                        /*hint*/ None,
-                    ));
-                }
-                Err(error) => self.add_to_history(history_cell::new_error_event(format!(
-                    "Copy failed: {error}"
-                ))),
-            },
-            _ if self.transcript.copy_history_evicted_by_rollback => {
-                self.add_to_history(history_cell::new_error_event(format!(
-                    "Cannot copy that response after rewinding. Only the most recent {MAX_AGENT_COPY_HISTORY} responses are available to /copy."
-                )));
-            }
-            _ => self.add_to_history(history_cell::new_error_event(
-                "No agent response to copy".into(),
-            )),
-        }
-        self.request_redraw();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn last_agent_markdown_text(&self) -> Option<&str> {
-        self.transcript.last_agent_markdown.as_deref()
-    }
-
-    fn show_rename_prompt(&mut self) {
-        if !self.ensure_thread_rename_allowed() {
-            return;
-        }
-        let tx = self.app_event_tx.clone();
-        let existing_name = self.thread_name.as_deref().filter(|name| !name.is_empty());
-        let title = if existing_name.is_some() {
-            "Rename thread"
-        } else {
-            "Name thread"
-        };
-        let view = CustomPromptView::new(
-            title.to_string(),
-            "Type a name and press Enter".to_string(),
-            /*initial_text*/ existing_name.unwrap_or_default().to_string(),
-            /*context_label*/ None,
-            Box::new(move |name: String| {
-                let Some(name) = crate::legacy_core::util::normalize_thread_name(&name) else {
-                    tx.send(AppEvent::InsertHistoryCell(Box::new(
-                        history_cell::new_error_event("Thread name cannot be empty.".to_string()),
-                    )));
-                    return;
-                };
-                tx.set_thread_name(name);
-            }),
-        );
-
-        self.bottom_pane.show_view(Box::new(view));
-    }
-
-    fn ensure_thread_rename_allowed(&mut self) -> bool {
-        match self.thread_rename_block_message.clone() {
-            Some(message) => {
-                self.add_error_message(message);
-                false
-            }
-            None => true,
-        }
-    }
-
-    pub(crate) fn handle_paste(&mut self, text: String) {
-        self.bottom_pane.handle_paste(text);
-        self.refresh_plan_mode_nudge();
-    }
-
-    // Returns true if caller should skip rendering this frame (a future frame is scheduled).
-    pub(crate) fn handle_paste_burst_tick(&mut self, frame_requester: FrameRequester) -> bool {
-        if self.bottom_pane.flush_paste_burst_if_due() {
-            self.refresh_plan_mode_nudge();
-            // A paste just flushed; request an immediate redraw and skip this frame.
-            self.request_redraw();
-            true
-        } else if self.bottom_pane.is_in_paste_burst() {
-            // While capturing a burst, schedule a follow-up tick and skip this frame
-            // to avoid redundant renders between ticks.
-            frame_requester.schedule_frame_in(
-                crate::bottom_pane::ChatComposer::recommended_paste_flush_delay(),
-            );
-            true
-        } else {
-            false
-        }
+        self.refresh_status_line_if_workspace_headline_due();
     }
 
     fn flush_active_cell(&mut self) {
         if let Some(active) = self.transcript.active_cell.take() {
             self.transcript.needs_final_message_separator = true;
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
+            self.request_pending_usage_output_insertion();
         }
     }
 
@@ -1940,6 +1217,9 @@ impl ChatWidget {
     }
 
     fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>) {
+        if self.turn_lifecycle.agent_turn_running && !cell.display_lines(u16::MAX).is_empty() {
+            self.record_visible_turn_activity();
+        }
         // Keep the placeholder session header as the active cell until real session info arrives,
         // so we can merge headers instead of committing a duplicate box to history.
         let keep_placeholder_header_active = !self.is_session_configured()
@@ -1987,9 +1267,75 @@ impl ChatWidget {
     fn on_committed_user_message(&mut self, items: &[UserInput], from_replay: bool) {
         let display = Self::user_message_display_from_inputs(items);
         if from_replay {
-            if !self.review.is_review_mode {
-                self.on_user_message_display(display);
+            if self.review.is_review_mode {
+                return;
             }
+            let message = display.message.as_str();
+            let mention_start = |sigil: char, mention: &str| {
+                let token = format!("{sigil}{mention}");
+                message.match_indices(&token).find_map(|(start, _)| {
+                    let end = start + token.len();
+                    message
+                        .as_bytes()
+                        .get(end)
+                        .is_none_or(|byte| {
+                            !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-')
+                        })
+                        .then_some(start)
+                })
+            };
+            let mut mention_bindings: Vec<MentionBinding> = items
+                .iter()
+                .filter_map(|item| match item {
+                    UserInput::Skill { name, path } => Some(MentionBinding {
+                        sigil: TOOL_MENTION_SIGIL,
+                        mention: name.clone(),
+                        path: path.to_string_lossy().into_owned(),
+                    }),
+                    UserInput::Mention { name, path } => {
+                        let plugin_id = path.strip_prefix("plugin://");
+                        let mention = if let Some(plugin_id) = plugin_id {
+                            plugin_id
+                                .split_once('@')
+                                .map(|(plugin_name, _)| plugin_name)
+                                .unwrap_or(plugin_id)
+                                .to_string()
+                        } else if path.starts_with("app://") {
+                            codex_connectors::metadata::connector_mention_slug_from_name(name)
+                        } else {
+                            name.clone()
+                        };
+                        let sigil = if plugin_id.is_some()
+                            && mention_start(PLUGIN_TEXT_MENTION_SIGIL, &mention).is_some()
+                        {
+                            PLUGIN_TEXT_MENTION_SIGIL
+                        } else {
+                            TOOL_MENTION_SIGIL
+                        };
+                        Some(MentionBinding {
+                            sigil,
+                            mention,
+                            path: path.clone(),
+                        })
+                    }
+                    UserInput::Text { .. }
+                    | UserInput::Image { .. }
+                    | UserInput::LocalImage { .. } => None,
+                })
+                .collect();
+            mention_bindings.sort_by_key(|binding| {
+                mention_start(binding.sigil, &binding.mention).unwrap_or(usize::MAX)
+            });
+            self.bottom_pane
+                .record_replayed_user_message_history(HistoryEntry {
+                    text: display.message.clone(),
+                    text_elements: display.text_elements.clone(),
+                    local_image_paths: display.local_images.clone(),
+                    remote_image_urls: display.remote_image_urls.clone(),
+                    mention_bindings,
+                    pending_pastes: Vec::new(),
+                });
+            self.on_user_message_display(display);
             return;
         }
 
@@ -2055,31 +1401,16 @@ impl ChatWidget {
             .send(AppEvent::Exit(ExitMode::ShutdownFirst));
     }
 
+    pub(crate) fn show_shutdown_in_progress(&mut self) {
+        self.bottom_pane.show_shutdown_in_progress();
+    }
+
     fn request_redraw(&mut self) {
         self.frame_requester.schedule_frame();
     }
 
     fn bump_active_cell_revision(&mut self) {
         self.transcript.bump_active_cell_revision();
-    }
-
-    fn notify(&mut self, notification: Notification) {
-        if !notification.allowed_for(&self.config.tui_notifications.notifications) {
-            return;
-        }
-        if let Some(existing) = self.pending_notification.as_ref()
-            && existing.priority() > notification.priority()
-        {
-            return;
-        }
-        self.pending_notification = Some(notification);
-        self.request_redraw();
-    }
-
-    pub(crate) fn maybe_post_pending_notification(&mut self, tui: &mut crate::tui::Tui) {
-        if let Some(notif) = self.pending_notification.take() {
-            tui.notify(notif.display());
-        }
     }
 
     /// Mark the active cell as failed (✗) and flush it into history.
@@ -2092,6 +1423,7 @@ impl ChatWidget {
                 tool.mark_failed();
             }
             self.add_boxed_history(cell);
+            self.request_pending_usage_output_insertion();
         }
     }
 
@@ -2233,16 +1565,14 @@ impl ChatWidget {
     }
 
     fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
-        let resume_cmd = crate::legacy_core::util::resume_command(Some(name), thread_id)
-            .unwrap_or_else(|| format!("codex resume {name}"));
-        let name = name.to_string();
-        let line = vec![
+        let mut line = vec![
             "• ".into(),
-            "Thread renamed to ".into(),
-            name.cyan(),
-            ", to resume this thread run ".into(),
-            resume_cmd.cyan(),
+            "Session renamed to ".into(),
+            name.to_string().cyan(),
         ];
+        if let Some(hint) = resume_hint(Some(name), thread_id) {
+            line.extend([". To resume this session run ".into(), hint.cyan()]);
+        }
         PlainHistoryCell::new(vec![line.into()])
     }
 
@@ -2259,8 +1589,10 @@ impl ChatWidget {
         )));
         self.bump_active_cell_revision();
         self.request_redraw();
-        self.app_event_tx
-            .send(AppEvent::FetchMcpInventory { detail });
+        self.app_event_tx.send(AppEvent::FetchMcpInventory {
+            detail,
+            thread_id: self.thread_id(),
+        });
     }
 
     /// Remove the MCP loading spinner if it is still the active cell.
@@ -2285,123 +1617,6 @@ impl ChatWidget {
     /// Forward file-search results to the bottom pane.
     pub(crate) fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
         self.bottom_pane.on_file_search_result(query, matches);
-    }
-
-    /// Handles a Ctrl+C press at the chat-widget layer.
-    ///
-    /// The first press arms a time-bounded quit shortcut and shows a footer hint via the bottom
-    /// pane. If cancellable work is active, Ctrl+C also submits `Op::Interrupt` after the shortcut
-    /// is armed.
-    ///
-    /// Active realtime conversations take precedence over bottom-pane Ctrl+C handling so the
-    /// first press always stops live voice, even when the composer contains the recording meter.
-    ///
-    /// When the double-press quit shortcut is enabled, pressing the same shortcut again before
-    /// expiry requests a shutdown-first quit.
-    fn on_ctrl_c(&mut self) {
-        let key = key_hint::ctrl(KeyCode::Char('c'));
-        if self.realtime_conversation.is_live() {
-            self.bottom_pane.clear_quit_shortcut_hint();
-            self.quit_shortcut_expires_at = None;
-            self.quit_shortcut_key = None;
-            self.stop_realtime_conversation_from_ui();
-            return;
-        }
-        let modal_or_popup_active = !self.bottom_pane.no_modal_or_popup_active();
-        if self.bottom_pane.on_ctrl_c() == CancellationEvent::Handled {
-            if DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED {
-                if modal_or_popup_active {
-                    self.quit_shortcut_expires_at = None;
-                    self.quit_shortcut_key = None;
-                    self.bottom_pane.clear_quit_shortcut_hint();
-                } else {
-                    self.arm_quit_shortcut(key);
-                }
-            }
-            return;
-        }
-
-        if !DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED {
-            if self.is_cancellable_work_active() {
-                self.quit_shortcut_expires_at = None;
-                self.quit_shortcut_key = None;
-                self.bottom_pane.clear_quit_shortcut_hint();
-                self.submit_op(AppCommand::interrupt());
-            } else {
-                self.request_quit_without_confirmation();
-            }
-            return;
-        }
-
-        if self.quit_shortcut_active_for(key) {
-            self.quit_shortcut_expires_at = None;
-            self.quit_shortcut_key = None;
-            self.request_quit_without_confirmation();
-            return;
-        }
-
-        self.arm_quit_shortcut(key);
-
-        if self.is_cancellable_work_active() {
-            self.submit_op(AppCommand::interrupt());
-        }
-    }
-
-    /// Handles a Ctrl+D press at the chat-widget layer.
-    ///
-    /// Ctrl-D only participates in quit when the composer is empty and no modal/popup is active.
-    /// Otherwise it should be routed to the active view and not attempt to quit.
-    fn on_ctrl_d(&mut self) -> bool {
-        let key = key_hint::ctrl(KeyCode::Char('d'));
-        if !DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED {
-            if !self.bottom_pane.composer_is_empty() || !self.bottom_pane.no_modal_or_popup_active()
-            {
-                return false;
-            }
-
-            self.request_quit_without_confirmation();
-            return true;
-        }
-
-        if self.quit_shortcut_active_for(key) {
-            self.quit_shortcut_expires_at = None;
-            self.quit_shortcut_key = None;
-            self.request_quit_without_confirmation();
-            return true;
-        }
-
-        if !self.bottom_pane.composer_is_empty() || !self.bottom_pane.no_modal_or_popup_active() {
-            return false;
-        }
-
-        self.arm_quit_shortcut(key);
-        true
-    }
-
-    /// True if `key` matches the armed quit shortcut and the window has not expired.
-    fn quit_shortcut_active_for(&self, key: KeyBinding) -> bool {
-        self.quit_shortcut_key == Some(key)
-            && self
-                .quit_shortcut_expires_at
-                .is_some_and(|expires_at| Instant::now() < expires_at)
-    }
-
-    /// Arm the double-press quit shortcut and show the footer hint.
-    ///
-    /// This keeps the state machine (`quit_shortcut_*`) in `ChatWidget`, since
-    /// it is the component that interprets Ctrl+C vs Ctrl+D and decides whether
-    /// quitting is currently allowed, while delegating rendering to `BottomPane`.
-    fn arm_quit_shortcut(&mut self, key: KeyBinding) {
-        self.quit_shortcut_expires_at = Instant::now()
-            .checked_add(QUIT_SHORTCUT_TIMEOUT)
-            .or_else(|| Some(Instant::now()));
-        self.quit_shortcut_key = Some(key);
-        self.bottom_pane.show_quit_shortcut_hint(key);
-    }
-
-    // Review mode counts as cancellable work so Ctrl+C interrupts instead of quitting.
-    fn is_cancellable_work_active(&self) -> bool {
-        self.bottom_pane.is_task_running() || self.review.is_review_mode
     }
 
     /// Return the markdown body width available to an active stream.
@@ -2470,9 +1685,8 @@ impl ChatWidget {
 
     /// Update resize-sensitive chat widget state after the terminal width changes.
     ///
-    /// The app calls this even when terminal resize reflow is disabled so live stream wrapping
-    /// remains consistent with the current viewport. Finalized transcript rebuilding stays gated at
-    /// the app layer.
+    /// Live stream wrapping stays consistent with the current viewport while finalized transcript
+    /// rebuilding runs through app-level resize reflow.
     pub(crate) fn on_terminal_resize(&mut self, width: u16) {
         let had_rendered_width = self.last_rendered_width.get().is_some();
         self.last_rendered_width.set(Some(width as usize));
@@ -2624,7 +1838,12 @@ impl ChatWidget {
     }
 
     pub(crate) fn prepare_local_op_submission(&mut self, op: &AppCommand) {
-        if matches!(op, AppCommand::Interrupt) && self.turn_lifecycle.agent_turn_running {
+        if let AppCommand::Interrupt { behavior } = op
+            && self.turn_lifecycle.agent_turn_running
+        {
+            if *behavior == crate::app_command::InterruptBehavior::RestorePromptIfNoOutput {
+                self.arm_cancel_edit();
+            }
             if let Some(controller) = self.stream_controller.as_mut() {
                 controller.clear_queue();
             }
@@ -2663,153 +1882,9 @@ impl ChatWidget {
     pub(crate) fn sync_plugin_mentions_config(&mut self, config: &Config) {
         self.config.features = config.features.clone();
         self.config.config_layer_stack = config.config_layer_stack.clone();
-        self.config.realtime = config.realtime.clone();
         self.config.memories = config.memories.clone();
         self.config.terminal_resize_reflow = config.terminal_resize_reflow;
         self.sync_mentions_v2_enabled();
-    }
-
-    pub(crate) fn open_review_popup(&mut self) {
-        let mut items: Vec<SelectionItem> = Vec::new();
-
-        items.push(SelectionItem {
-            name: "Review against a base branch".to_string(),
-            description: Some("(PR Style)".into()),
-            actions: vec![Box::new({
-                let cwd = self.config.cwd.to_path_buf();
-                move |tx| {
-                    tx.send(AppEvent::OpenReviewBranchPicker(cwd.clone()));
-                }
-            })],
-            dismiss_on_select: false,
-            dismiss_parent_on_child_accept: true,
-            ..Default::default()
-        });
-
-        items.push(SelectionItem {
-            name: "Review uncommitted changes".to_string(),
-            actions: vec![Box::new(move |tx: &AppEventSender| {
-                tx.review(ReviewTarget::UncommittedChanges);
-            })],
-            dismiss_on_select: true,
-            ..Default::default()
-        });
-
-        // New: Review a specific commit (opens commit picker)
-        items.push(SelectionItem {
-            name: "Review a commit".to_string(),
-            actions: vec![Box::new({
-                let cwd = self.config.cwd.to_path_buf();
-                move |tx| {
-                    tx.send(AppEvent::OpenReviewCommitPicker(cwd.clone()));
-                }
-            })],
-            dismiss_on_select: false,
-            dismiss_parent_on_child_accept: true,
-            ..Default::default()
-        });
-
-        items.push(SelectionItem {
-            name: "Custom review instructions".to_string(),
-            actions: vec![Box::new(move |tx| {
-                tx.send(AppEvent::OpenReviewCustomPrompt);
-            })],
-            dismiss_on_select: false,
-            dismiss_parent_on_child_accept: true,
-            ..Default::default()
-        });
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some("Select a review preset".into()),
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
-            ..Default::default()
-        });
-    }
-
-    pub(crate) async fn show_review_branch_picker(&mut self, cwd: &Path) {
-        let branches = local_git_branches(cwd).await;
-        let current_branch = current_branch_name(cwd)
-            .await
-            .unwrap_or_else(|| "(detached HEAD)".to_string());
-        let mut items: Vec<SelectionItem> = Vec::with_capacity(branches.len());
-
-        for option in branches {
-            let branch = option.clone();
-            items.push(SelectionItem {
-                name: format!("{current_branch} -> {branch}"),
-                actions: vec![Box::new(move |tx3: &AppEventSender| {
-                    tx3.review(ReviewTarget::BaseBranch {
-                        branch: branch.clone(),
-                    });
-                })],
-                dismiss_on_select: true,
-                search_value: Some(option),
-                ..Default::default()
-            });
-        }
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some("Select a base branch".to_string()),
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
-            is_searchable: true,
-            search_placeholder: Some("Type to search branches".to_string()),
-            ..Default::default()
-        });
-    }
-
-    pub(crate) async fn show_review_commit_picker(&mut self, cwd: &Path) {
-        let commits = recent_commits(cwd, /*limit*/ 100).await;
-
-        let mut items: Vec<SelectionItem> = Vec::with_capacity(commits.len());
-        for entry in commits {
-            let subject = entry.subject.clone();
-            let sha = entry.sha.clone();
-            let search_val = format!("{subject} {sha}");
-
-            items.push(SelectionItem {
-                name: subject.clone(),
-                actions: vec![Box::new(move |tx3: &AppEventSender| {
-                    tx3.review(ReviewTarget::Commit {
-                        sha: sha.clone(),
-                        title: Some(subject.clone()),
-                    });
-                })],
-                dismiss_on_select: true,
-                search_value: Some(search_val),
-                ..Default::default()
-            });
-        }
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some("Select a commit to review".to_string()),
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
-            is_searchable: true,
-            search_placeholder: Some("Type to search commits".to_string()),
-            ..Default::default()
-        });
-    }
-
-    pub(crate) fn show_review_custom_prompt(&mut self) {
-        let tx = self.app_event_tx.clone();
-        let view = CustomPromptView::new(
-            "Custom review instructions".to_string(),
-            "Type instructions and press Enter".to_string(),
-            /*initial_text*/ String::new(),
-            /*context_label*/ None,
-            Box::new(move |prompt: String| {
-                let trimmed = prompt.trim().to_string();
-                if trimmed.is_empty() {
-                    return;
-                }
-                tx.review(ReviewTarget::Custom {
-                    instructions: trimmed,
-                });
-            }),
-        );
-        self.bottom_pane.show_view(Box::new(view));
     }
 
     pub(crate) fn token_usage(&self) -> TokenUsage {
@@ -2836,12 +1911,12 @@ impl ChatWidget {
         self.current_rollout_path.clone()
     }
 
-    /// Returns a cache key describing the current in-flight active cell for the transcript overlay.
+    /// Returns a cache key describing the current in-flight cells for the transcript overlay.
     ///
     /// `Ctrl+T` renders committed transcript cells plus a render-only live tail derived from the
-    /// current active cell, and the overlay caches that tail; this key is what it uses to decide
-    /// whether it must recompute. When there is no active cell, this returns `None` so the overlay
-    /// can drop the tail entirely.
+    /// current active, hook, and asynchronous usage cells, and the overlay caches that tail; this
+    /// key is what it uses to decide whether it must recompute. When there are no live cells, this
+    /// returns `None` so the overlay can drop the tail entirely.
     ///
     /// If callers mutate the active cell's transcript output without bumping the revision (or
     /// providing an appropriate animation tick), the overlay will keep showing a stale tail while
@@ -2849,7 +1924,13 @@ impl ChatWidget {
     pub(crate) fn active_cell_transcript_key(&self) -> Option<ActiveCellTranscriptKey> {
         let cell = self.transcript.active_cell.as_ref();
         let hook_cell = self.active_hook_cell.as_ref();
-        if cell.is_none() && hook_cell.is_none() {
+        let token_activity_cell = self.pending_token_activity_output();
+        let rate_limit_reset_hint = self.pending_rate_limit_reset_hint();
+        if cell.is_none()
+            && hook_cell.is_none()
+            && token_activity_cell.is_none()
+            && rate_limit_reset_hint.is_none()
+        {
             return None;
         }
         Some(ActiveCellTranscriptKey {
@@ -2865,26 +1946,49 @@ impl ChatWidget {
         })
     }
 
-    /// Returns the active cell's transcript lines for a given terminal width.
+    /// Returns the active cell's annotated transcript lines for a given terminal width.
     ///
     /// This is a convenience for the transcript overlay live-tail path, and it intentionally
     /// filters out empty results so the overlay can treat "nothing to render" as "no tail". Callers
     /// should pass the same width the overlay uses; using a different width will cause wrapping
     /// mismatches between the main viewport and the transcript overlay.
-    pub(crate) fn active_cell_transcript_lines(&self, width: u16) -> Option<Vec<Line<'static>>> {
+    pub(crate) fn active_cell_transcript_hyperlink_lines(
+        &self,
+        width: u16,
+    ) -> Option<Vec<HyperlinkLine>> {
         let mut lines = Vec::new();
         if let Some(cell) = self.transcript.active_cell.as_ref() {
-            lines.extend(cell.transcript_lines(width));
+            lines.extend(cell.transcript_hyperlink_lines(width));
         }
         if let Some(hook_cell) = self.active_hook_cell.as_ref() {
             // Compute hook lines first so hidden hooks do not add a separator.
-            let hook_lines = hook_cell.transcript_lines(width);
+            let hook_lines = hook_cell.transcript_hyperlink_lines(width);
             if !hook_lines.is_empty() && !lines.is_empty() {
-                lines.push("".into());
+                lines.push(HyperlinkLine::from(""));
             }
             lines.extend(hook_lines);
         }
+        if let Some(token_activity_cell) = self.pending_token_activity_output() {
+            let token_activity_lines = token_activity_cell.transcript_hyperlink_lines(width);
+            if !token_activity_lines.is_empty() && !lines.is_empty() {
+                lines.push(HyperlinkLine::from(""));
+            }
+            lines.extend(token_activity_lines);
+        }
+        if let Some(rate_limit_reset_hint) = self.pending_rate_limit_reset_hint() {
+            let hint_lines = rate_limit_reset_hint.transcript_hyperlink_lines(width);
+            if !hint_lines.is_empty() && !lines.is_empty() {
+                lines.push(HyperlinkLine::from(""));
+            }
+            lines.extend(hint_lines);
+        }
         (!lines.is_empty()).then_some(lines)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_cell_transcript_lines(&self, width: u16) -> Option<Vec<Line<'static>>> {
+        self.active_cell_transcript_hyperlink_lines(width)
+            .map(crate::terminal_hyperlinks::visible_lines)
     }
 
     /// Return a reference to the widget's current config (includes any
@@ -2901,128 +2005,6 @@ impl ChatWidget {
     pub(crate) fn clear_token_usage(&mut self) {
         self.token_info = None;
     }
-
-    fn as_renderable(&self) -> RenderableItem<'_> {
-        let active_cell_right_reserve = self.ambient_pet_wrap_reserved_cols();
-        let active_cell_renderable = match &self.transcript.active_cell {
-            Some(cell) => RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
-                child: cell.as_ref(),
-                top: 1,
-                right: active_cell_right_reserve,
-            })),
-            None => RenderableItem::Owned(Box::new(())),
-        };
-        let active_hook_cell_renderable = match &self.active_hook_cell {
-            Some(cell) if cell.should_render() => {
-                RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
-                    child: cell,
-                    top: 1,
-                    right: active_cell_right_reserve,
-                }))
-            }
-            _ => RenderableItem::Owned(Box::new(())),
-        };
-        let mut flex = FlexRenderable::new();
-        flex.push(/*flex*/ 1, active_cell_renderable);
-        flex.push(/*flex*/ 0, active_hook_cell_renderable);
-        flex.push(
-            /*flex*/ 0,
-            RenderableItem::Owned(Box::new(BottomPaneComposerReserveRenderable {
-                bottom_pane: &self.bottom_pane,
-                right_reserve: active_cell_right_reserve,
-            }))
-            .inset(Insets::tlbr(
-                /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
-            )),
-        );
-        RenderableItem::Owned(Box::new(flex))
-    }
-}
-
-struct BottomPaneComposerReserveRenderable<'a> {
-    bottom_pane: &'a BottomPane,
-    right_reserve: u16,
-}
-
-impl Renderable for BottomPaneComposerReserveRenderable<'_> {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        self.bottom_pane
-            .render_with_composer_right_reserve(area, buf, self.right_reserve);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        self.bottom_pane
-            .desired_height_with_composer_right_reserve(width, self.right_reserve)
-    }
-
-    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        self.bottom_pane
-            .cursor_pos_with_composer_right_reserve(area, self.right_reserve)
-    }
-
-    fn cursor_style(&self, area: Rect) -> crossterm::cursor::SetCursorStyle {
-        self.bottom_pane
-            .cursor_style_with_composer_right_reserve(area, self.right_reserve)
-    }
-}
-
-struct TranscriptAreaRenderable<'a> {
-    child: &'a dyn HistoryCell,
-    top: u16,
-    right: u16,
-}
-
-impl Renderable for TranscriptAreaRenderable<'_> {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        let area = self.child_area(area);
-        let lines = self.child.display_lines(area.width);
-        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-        let y = if area.height == 0 {
-            0
-        } else {
-            let overflow = paragraph
-                .line_count(area.width)
-                .saturating_sub(usize::from(area.height));
-            u16::try_from(overflow).unwrap_or(u16::MAX)
-        };
-        Clear.render(area, buf);
-        paragraph.scroll((y, 0)).render(area, buf);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        let child_width = width.saturating_sub(self.right).max(1);
-        HistoryCell::desired_height(self.child, child_width) + self.top
-    }
-}
-
-impl TranscriptAreaRenderable<'_> {
-    fn child_area(&self, area: Rect) -> Rect {
-        let y = area.y.saturating_add(self.top);
-        let height = area.height.saturating_sub(self.top);
-        Rect::new(
-            area.x,
-            y,
-            area.width.saturating_sub(self.right).max(1),
-            height,
-        )
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-impl ChatWidget {
-    pub(crate) fn update_recording_meter_in_place(&mut self, id: &str, text: &str) -> bool {
-        let updated = self.bottom_pane.update_recording_meter_in_place(id, text);
-        if updated {
-            self.request_redraw();
-        }
-        updated
-    }
-
-    pub(crate) fn remove_recording_meter_placeholder(&mut self, id: &str) {
-        self.bottom_pane.remove_recording_meter_placeholder(id);
-        // Ensure the UI redraws to reflect placeholder removal.
-        self.request_redraw();
-    }
 }
 
 fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {
@@ -3036,133 +2018,9 @@ fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {
 
 impl Drop for ChatWidget {
     fn drop(&mut self) {
-        self.reset_realtime_conversation_state();
         self.stop_rate_limit_poller();
     }
 }
-
-impl Renderable for ChatWidget {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        self.as_renderable().render(area, buf);
-        self.last_rendered_width.set(Some(area.width as usize));
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        self.as_renderable().desired_height(width)
-    }
-
-    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        self.as_renderable().cursor_pos(area)
-    }
-
-    fn cursor_style(&self, area: Rect) -> crossterm::cursor::SetCursorStyle {
-        self.as_renderable().cursor_style(area)
-    }
-}
-
-#[derive(Debug)]
-enum Notification {
-    AgentTurnComplete { response: String },
-    ExecApprovalRequested { command: String },
-    EditApprovalRequested { cwd: PathBuf, changes: Vec<PathBuf> },
-    ElicitationRequested { server_name: String },
-    PlanModePrompt { title: String },
-}
-
-impl Notification {
-    fn display(&self) -> String {
-        match self {
-            Notification::AgentTurnComplete { response } => {
-                Notification::agent_turn_preview(response)
-                    .unwrap_or_else(|| "Agent turn complete".to_string())
-            }
-            Notification::ExecApprovalRequested { command } => {
-                format!(
-                    "Approval requested: {}",
-                    truncate_text(command, /*max_graphemes*/ 30)
-                )
-            }
-            Notification::EditApprovalRequested { cwd, changes } => {
-                format!(
-                    "Codex wants to edit {}",
-                    if changes.len() == 1 {
-                        #[allow(clippy::unwrap_used)]
-                        display_path_for(changes.first().unwrap(), cwd)
-                    } else {
-                        format!("{} files", changes.len())
-                    }
-                )
-            }
-            Notification::ElicitationRequested { server_name } => {
-                format!("Approval requested by {server_name}")
-            }
-            Notification::PlanModePrompt { title } => {
-                format!("Plan mode prompt: {title}")
-            }
-        }
-    }
-
-    fn type_name(&self) -> &str {
-        match self {
-            Notification::AgentTurnComplete { .. } => "agent-turn-complete",
-            Notification::ExecApprovalRequested { .. }
-            | Notification::EditApprovalRequested { .. }
-            | Notification::ElicitationRequested { .. } => "approval-requested",
-            Notification::PlanModePrompt { .. } => "plan-mode-prompt",
-        }
-    }
-
-    fn priority(&self) -> u8 {
-        match self {
-            Notification::AgentTurnComplete { .. } => 0,
-            Notification::ExecApprovalRequested { .. }
-            | Notification::EditApprovalRequested { .. }
-            | Notification::ElicitationRequested { .. }
-            | Notification::PlanModePrompt { .. } => 1,
-        }
-    }
-
-    fn allowed_for(&self, settings: &Notifications) -> bool {
-        match settings {
-            Notifications::Enabled(enabled) => *enabled,
-            Notifications::Custom(allowed) => allowed.iter().any(|a| a == self.type_name()),
-        }
-    }
-
-    fn agent_turn_preview(response: &str) -> Option<String> {
-        let mut normalized = String::new();
-        for part in response.split_whitespace() {
-            if !normalized.is_empty() {
-                normalized.push(' ');
-            }
-            normalized.push_str(part);
-        }
-        let trimmed = normalized.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(truncate_text(trimmed, AGENT_NOTIFICATION_PREVIEW_GRAPHEMES))
-        }
-    }
-
-    fn user_input_request_summary(
-        questions: &[codex_app_server_protocol::ToolRequestUserInputQuestion],
-    ) -> Option<String> {
-        let first_question = questions.first()?;
-        let summary = if first_question.header.trim().is_empty() {
-            first_question.question.trim()
-        } else {
-            first_question.header.trim()
-        };
-        if summary.is_empty() {
-            None
-        } else {
-            Some(truncate_text(summary, /*max_graphemes*/ 30))
-        }
-    }
-}
-
-const AGENT_NOTIFICATION_PREVIEW_GRAPHEMES: usize = 200;
 
 const PLACEHOLDERS: [&str; 8] = [
     "Explain this codebase",
@@ -3209,41 +2067,6 @@ fn extract_first_bold(s: &str) -> Option<String> {
         i += 1;
     }
     None
-}
-
-#[cfg(test)]
-pub(crate) fn show_review_commit_picker_with_entries(
-    chat: &mut ChatWidget,
-    entries: Vec<CommitLogEntry>,
-) {
-    let mut items: Vec<SelectionItem> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let subject = entry.subject.clone();
-        let sha = entry.sha.clone();
-        let search_val = format!("{subject} {sha}");
-
-        items.push(SelectionItem {
-            name: subject.clone(),
-            actions: vec![Box::new(move |tx3: &AppEventSender| {
-                tx3.review(ReviewTarget::Commit {
-                    sha: sha.clone(),
-                    title: Some(subject.clone()),
-                });
-            })],
-            dismiss_on_select: true,
-            search_value: Some(search_val),
-            ..Default::default()
-        });
-    }
-
-    chat.bottom_pane.show_selection_view(SelectionViewParams {
-        title: Some("Select a commit to review".to_string()),
-        footer_hint: Some(standard_popup_hint_line()),
-        items,
-        is_searchable: true,
-        search_placeholder: Some("Type to search commits".to_string()),
-        ..Default::default()
-    });
 }
 
 #[cfg(test)]
